@@ -2,15 +2,28 @@ use crate::protocol::{
     IntentAbortParams, IntentAmendParams, IntentProposeParams, IntentSealParams, JsonRpcError,
     JsonRpcRequest, JsonRpcResponse, ToolCallParams,
 };
-use crate::session::SessionManager;
+use crate::session::{SessionError, SessionManager};
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub fn create_router(session_manager: Arc<SessionManager>) -> Router {
     Router::new()
         .route("/", post(handle_json_rpc))
         .with_state(session_manager)
+}
+
+fn session_failure(id: Value, error: SessionError) -> Json<JsonRpcResponse> {
+    Json(JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code: error.code,
+            message: error.message,
+            data: error.data,
+        }),
+    })
 }
 
 async fn handle_json_rpc(
@@ -47,16 +60,7 @@ async fn handle_json_rpc(
                     result: Some(json!(res)),
                     error: None,
                 }),
-                Err(err) => Json(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: req.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32001,
-                        message: err,
-                        data: None,
-                    }),
-                }),
+                Err(error) => session_failure(req.id, error),
             }
         }
         "tools/call" => {
@@ -86,16 +90,7 @@ async fn handle_json_rpc(
                     result: Some(res),
                     error: None,
                 }),
-                Err((code, msg, data)) => Json(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: req.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code,
-                        message: msg,
-                        data,
-                    }),
-                }),
+                Err(error) => session_failure(req.id, error),
             }
         }
         "intent/amend" => {
@@ -125,16 +120,7 @@ async fn handle_json_rpc(
                     result: Some(result),
                     error: None,
                 }),
-                Err(message) => Json(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: req.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32004,
-                        message,
-                        data: None,
-                    }),
-                }),
+                Err(error) => session_failure(req.id, error),
             }
         }
         "intent/seal" => {
@@ -164,16 +150,7 @@ async fn handle_json_rpc(
                     result: Some(res),
                     error: None,
                 }),
-                Err(err) => Json(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: req.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32001,
-                        message: err,
-                        data: None,
-                    }),
-                }),
+                Err(error) => session_failure(req.id, error),
             }
         }
         "intent/abort" => {
@@ -203,16 +180,7 @@ async fn handle_json_rpc(
                     result: Some(res),
                     error: None,
                 }),
-                Err(err) => Json(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: req.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32001,
-                        message: err,
-                        data: None,
-                    }),
-                }),
+                Err(error) => session_failure(req.id, error),
             }
         }
         _ => Json(JsonRpcResponse {
@@ -225,5 +193,27 @@ async fn handle_json_rpc(
                 data: None,
             }),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_errors_preserve_protocol_code_and_data() {
+        let lifecycle_code = crate::protocol::error_code::INVALID_LIFECYCLE;
+        let response = session_failure(
+            json!("request-1"),
+            SessionError {
+                code: lifecycle_code,
+                message: "invalid lifecycle".to_string(),
+                data: Some(json!({"status": "SETTLED"})),
+            },
+        )
+        .0;
+        let error = response.error.expect("response should contain an error");
+        assert_eq!(error.code, lifecycle_code);
+        assert_eq!(error.data, Some(json!({"status": "SETTLED"})));
     }
 }

@@ -8,26 +8,16 @@ Clared explores a specific failure mode in action-taking agents: every tool call
 
 An order agent might update a database, authorize a payment, and notify a customer. If a late step fails, a per-call gateway cannot by itself reconcile the state already created by earlier calls. Clared places the whole operation inside a bounded execution session, meters aggregate budgets, stages actions through declared adapters, revalidates policy at seal time, and reports the final outcome explicitly.
 
+We are looking for teams whose agents mutate databases, payment systems, infrastructure, or external APIs across a single task. [Challenge the protocol in Discussions](https://github.com/clared-ai/clared/discussions), or email [liran@clared.ai](mailto:liran@clared.ai) to evaluate a concrete workflow privately.
+
 ## Run the fault-injection demo
 
-The demo compares an unsafe workflow with the Clared reference simulator. No external accounts or API keys are required.
+The demo compares an unsafe workflow with the Clared reference simulator. No external accounts or API keys are required. It requires Rust and Python 3.10+; `uv` is used when available.
 
 ```bash
 git clone https://github.com/clared-ai/clared.git
 cd clared
-export CLARED_DELEGATION_SECRET=0123456789abcdef0123456789abcdef
-
-# Terminal 1
-cd clared-core
-cargo run
-```
-
-```bash
-# Terminal 2, from the repository root
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ./clared-python
-python examples/fault_injection_demo.py
+make demo
 ```
 
 Expected comparison:
@@ -46,10 +36,11 @@ Clared success path: SETTLED with SHA-256 evidence and Ed25519 signature
 | Capability | Short-lived Ed25519-signed token bound to one session and generation |
 | Tool access | Fail-closed allowlist; every allowed tool must have a registered adapter |
 | Resource scope | Adapter-declared argument types must match a qualified envelope target |
+| Policy | Default-deny Cedar admission; reserved approval context cannot come from tool arguments |
 | Aggregate budgets | Integer-only typed dimensions, including money, mutations, and notifications |
 | Lifecycle | Expiry and terminal states are enforced; settled or aborted sessions cannot execute |
 | Replay control | Tool, seal, and abort requests use scoped idempotency keys |
-| Commit evidence | Canonical outcome evidence is SHA-256 hashed and Ed25519 signed |
+| Commit evidence | Deterministically serialized outcome evidence is SHA-256 hashed and Ed25519 signed |
 
 Provider execution is deliberately simulated. Responses are labeled `in_memory_simulator` and use `SIMULATED_*` statuses. Real PostgreSQL, Stripe, and Twilio executors are future integration work.
 
@@ -73,6 +64,22 @@ tools/call ─────► allowlist + scope + budget + Cedar + idempotency
 
 The agent should not possess downstream credentials. A production boundary requires every mutating path to terminate at the enforcing proxy; the Python helper alone is not a sandbox.
 
+See the [threat model](docs/threat-model.md) for the trusted computing base, concrete attacks, implemented defenses, and residual risks.
+
+## Where Clared fits
+
+Clared is not a replacement for the systems below. It adds a stateful authority and settlement boundary around an agent-selected tool trajectory.
+
+| Category | Primary job | What remains outside it that Clared targets |
+| --- | --- | --- |
+| Durable workflow engines (for example Temporal or Restate) | Reliably execute an application-defined workflow | Bound authority for a non-deterministic sequence selected by an agent |
+| Policy engines (Cedar or OPA) | Decide whether one request is allowed from current facts | Track aggregate budgets and staged effects across calls, then revalidate at seal time |
+| LLM gateways | Govern model traffic, cost, routing, and observability | Govern downstream mutations after the model chooses an action |
+| Sandboxed runtimes | Isolate code, processes, files, or network access | Express which business effects may accumulate and how they settle |
+| Tool gateways and MCP permission layers | Expose tools and approve or deny individual calls | Bind the whole multi-tool operation to one capability, resource set, budget, lifecycle, and receipt |
+
+The proposed unit is the combination: session-scoped authority, aggregate typed budgets, adapter-declared staged effects, commit-time policy revalidation, and signed terminal evidence.
+
 ## Open specifications
 
 The contracts are Apache-2.0 licensed and independently implementable.
@@ -85,6 +92,8 @@ The contracts are Apache-2.0 licensed and independently implementable.
 See [specs/README.md](specs/README.md) for versioning and contribution guidance.
 
 ## Python integration
+
+The package is not published to PyPI yet. Install it from this repository while the `v0alpha1` API is still changing.
 
 Use `ClaredSession.call_tool` for every mutating action:
 
@@ -119,6 +128,8 @@ async with harness.session(
 
 Clared does not claim universal distributed ACID across arbitrary APIs. A future live executor will coordinate adapter-defined reservations, transactions, and compensators, but partial provider failures must still be represented as explicit degraded states. The current release proves the envelope and lifecycle mechanics against an in-memory simulator only.
 
+See [ROADMAP.md](ROADMAP.md) for the evidence-gated path to an MCP-compatible shim, a real PostgreSQL transaction executor, conformance fixtures, and installable releases.
+
 ## Repository layout
 
 ```text
@@ -126,20 +137,14 @@ clared-core/       Rust JSON-RPC service, policy engine, capabilities, sessions
 clared-python/     Explicit Python harness and tool client
 adapters/          Versioned settlement adapter declarations
 specs/             Open execution-envelope and adapter specifications
+docs/              Threat model and security analysis
 examples/          Runnable fault-injection comparison
 ```
 
 ## Development
 
 ```bash
-cd clared-core
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-
-cd ../clared-python
-pip install -e ".[dev]"
-pytest -v
+make check
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Licensed under [Apache-2.0](LICENSE).

@@ -54,7 +54,7 @@ execution:
     endpoint: "/v1/payment_intents/{{staged_entity_id}}/cancel"
 ```
 
-The proxy qualifies each resource value as `<scope_prefix>:<argument_value>` and requires that exact value in the envelope targets. This prevents a customer identifier from matching an order scope merely because both terminal identifiers are equal. Budget arguments must be non-negative integers. Constant charges are used for count dimensions.
+The proxy qualifies each resource value as `<scope_prefix>:<argument_value>` and requires that exact value in the envelope targets. This prevents a customer identifier from matching an order scope merely because both terminal identifiers are equal. Every declared resource is independently evaluated by policy at call time and seal time. Budget arguments must be non-negative integers. Constant charges are used for count dimensions.
 
 Settlement proceeds by ascending `settlement_order`; rollback proceeds in reverse. Equal values retain call order. The reference declarations place transactional database work before payment capture and buffered notifications last.
 

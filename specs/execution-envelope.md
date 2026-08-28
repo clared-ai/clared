@@ -105,7 +105,7 @@ Evaluation order:
 3. Verify tool allowlist and adapter registration.
 4. Return a cached result for an identical idempotent replay; reject key reuse with a different request.
 5. Qualify adapter-declared resource arguments with their scope type and match every value to an envelope target.
-6. Evaluate deterministic policy.
+6. Evaluate deterministic policy independently for every matched resource. Reserved admission and approval context comes from the trusted proxy, not tool arguments.
 7. Reserve every adapter-declared budget charge atomically.
 8. Stage the adapter action.
 
@@ -125,12 +125,14 @@ Abort requires an idempotency key and valid active capability. It discards stage
 
 ## 5. Evidence
 
-The reference receipt contains a canonical JSON evidence object, `sha256:<hex>` digest, `ed25519:<base64url>` signature over the digest, and the base64url public key. Verifiers must reconstruct the evidence bytes exactly as defined by their implementation profile.
+The reference receipt contains a JSON evidence object, `sha256:<hex>` digest, `ed25519:<base64url>` signature over the digest, and the base64url public key. The current profile signs the deterministic `serde_json` serialization used by the Rust implementation; it does not yet define a cross-implementation canonical JSON format. Verifiers must reconstruct the bytes for the implementation profile exactly.
 
 ## 6. Error registry
 
 | Code | Meaning |
 | --- | --- |
+| `-32602` | Invalid method parameters |
+| `-32603` | Internal implementation or adapter error |
 | `-32001` | Insufficient typed budget |
 | `-32002` | Resource outside envelope |
 | `-32003` | Tool outside envelope |
@@ -140,6 +142,7 @@ The reference receipt contains a canonical JSON evidence object, `sha256:<hex>` 
 | `-32007` | Missing settlement adapter |
 | `-32008` | Invalid lifecycle transition |
 | `-32009` | Idempotency conflict |
+| `-32010` | Invalid, expired, or replayed delegation proof |
 
 ## 7. Non-guarantees
 

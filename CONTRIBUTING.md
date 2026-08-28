@@ -5,14 +5,7 @@ Clared is an experimental security reference implementation. Useful contribution
 Before opening a pull request:
 
 ```bash
-cd clared-core
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-
-cd ../clared-python
-pip install -e ".[dev]"
-pytest -v
+make check
 ```
 
 Protocol changes should include wire examples, compatibility impact, and adversarial tests. Adapter changes should explain the provider's real staging and rollback semantics. Do not label a synthetic identifier, in-memory mutation, or compensating action as atomic or live.

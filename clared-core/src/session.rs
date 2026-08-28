@@ -2,6 +2,11 @@ use crate::adapter::{AdapterRegistry, ExecutionMode, RegisteredTool};
 use crate::crypto::{CapabilityClaims, CapabilitySigner};
 use crate::delegation::verify_delegation_token;
 use crate::policy::{CedarEngine, PolicyOutcome};
+use crate::protocol::error_code::{
+    IDEMPOTENCY_CONFLICT, INSUFFICIENT_BUDGET, INTERNAL_ERROR, INVALID_CAPABILITY,
+    INVALID_DELEGATION, INVALID_LIFECYCLE, INVALID_PARAMS, MISSING_ADAPTER, POLICY_VIOLATION,
+    RESOURCE_OUTSIDE_ENVELOPE, TOOL_OUTSIDE_ENVELOPE, UNKNOWN_SESSION,
+};
 use crate::protocol::{
     IntentAbortParams, IntentAmendParams, IntentProposeParams, IntentProposeResult,
     IntentSealParams, SessionStatus, ToolCallParams, TypedBudgets,
@@ -13,13 +18,44 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
-type ToolError = (i32, String, Option<Value>);
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionError {
+    pub code: i32,
+    pub message: String,
+    pub data: Option<Value>,
+}
+
+impl SessionError {
+    fn new(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    fn with_data(code: i32, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: Some(data),
+        }
+    }
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Clared error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for SessionError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagedAction {
     pub tool_name: String,
     pub arguments: Value,
-    pub resource_id: String,
+    pub resource_ids: Vec<String>,
     pub adapter_name: String,
     pub mode: ExecutionMode,
     pub settlement_order: u32,
@@ -81,20 +117,33 @@ impl SessionManager {
         }
     }
 
-    pub fn propose(&self, params: IntentProposeParams) -> Result<IntentProposeResult, String> {
+    pub fn propose(
+        &self,
+        params: IntentProposeParams,
+    ) -> Result<IntentProposeResult, SessionError> {
         if !(1_000..=600_000).contains(&params.ttl_ms) {
-            return Err("ttl_ms must be between 1000 and 600000".to_string());
+            return Err(SessionError::new(
+                INVALID_PARAMS,
+                "ttl_ms must be between 1000 and 600000",
+            ));
         }
         if params.allowed_tools.is_empty() {
-            return Err("allowed_tools must contain at least one adapted tool".to_string());
+            return Err(SessionError::new(
+                INVALID_PARAMS,
+                "allowed_tools must contain at least one adapted tool",
+            ));
         }
         for tool in &params.allowed_tools {
             let adapter = self.adapters.get(tool).ok_or_else(|| {
-                format!("Tool '{tool}' has no registered Clared Settlement Adapter")
+                SessionError::new(
+                    MISSING_ADAPTER,
+                    format!("Tool '{tool}' has no registered Clared Settlement Adapter"),
+                )
             })?;
             if !adapter.resource_arguments.is_empty() && params.target_resources.is_empty() {
-                return Err(format!(
-                    "Tool '{tool}' requires at least one target_resources scope"
+                return Err(SessionError::new(
+                    RESOURCE_OUTSIDE_ENVELOPE,
+                    format!("Tool '{tool}' requires at least one target_resources scope"),
                 ));
             }
         }
@@ -108,7 +157,8 @@ impl SessionManager {
             &params.agent_role,
             &params.task_intent,
             now_ms,
-        )?;
+        )
+        .map_err(|message| SessionError::new(INVALID_DELEGATION, message))?;
 
         let session_id = format!("ses_{}", Uuid::new_v4().simple());
         let expires_at_ms = now_ms + params.ttl_ms as i64;
@@ -121,7 +171,10 @@ impl SessionManager {
             expires_at_ms,
             jti: format!("jti_{}", Uuid::new_v4().simple()),
         };
-        let capability_token = self.signer.issue(&claims)?;
+        let capability_token = self
+            .signer
+            .issue(&claims)
+            .map_err(|message| SessionError::new(INTERNAL_ERROR, message))?;
 
         let session = ActiveSession {
             session_id: session_id.clone(),
@@ -156,22 +209,28 @@ impl SessionManager {
         })
     }
 
-    pub fn amend(&self, params: IntentAmendParams) -> Result<Value, String> {
-        let claims = self.signer.verify(&params.capability_token)?;
+    pub fn amend(&self, params: IntentAmendParams) -> Result<Value, SessionError> {
+        let claims = self
+            .signer
+            .verify(&params.capability_token)
+            .map_err(|message| SessionError::new(INVALID_CAPABILITY, message))?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut sessions = self.sessions.write();
-        let session = sessions
-            .get_mut(&params.session_id)
-            .ok_or_else(|| format!("Session '{}' not found", params.session_id))?;
+        let session = sessions.get_mut(&params.session_id).ok_or_else(|| {
+            SessionError::new(
+                UNKNOWN_SESSION,
+                format!("Session '{}' not found", params.session_id),
+            )
+        })?;
 
         Self::validate_capability(session, &claims, &params.capability_token, now_ms)?;
         if !matches!(
             session.status,
             SessionStatus::Admitted | SessionStatus::Active
         ) {
-            return Err(format!(
-                "Session cannot be amended from state {:?}",
-                session.status
+            return Err(SessionError::new(
+                INVALID_LIFECYCLE,
+                format!("Session cannot be amended from state {:?}", session.status),
             ));
         }
         verify_delegation_token(
@@ -182,14 +241,17 @@ impl SessionManager {
             &session.agent_role,
             &session.task_intent,
             now_ms,
-        )?;
+        )
+        .map_err(|message| SessionError::new(INVALID_DELEGATION, message))?;
 
         let mut next_budgets = session.remaining_budgets.clone();
-        next_budgets.add_assign(&params.budget_additions)?;
+        next_budgets
+            .add_assign(&params.budget_additions)
+            .map_err(|message| SessionError::new(INSUFFICIENT_BUDGET, message))?;
         let next_generation = session
             .generation
             .checked_add(1)
-            .ok_or("Session generation overflow")?;
+            .ok_or_else(|| SessionError::new(INTERNAL_ERROR, "Session generation overflow"))?;
         let new_claims = CapabilityClaims {
             session_id: session.session_id.clone(),
             tenant_id: session.tenant_id.clone(),
@@ -199,7 +261,10 @@ impl SessionManager {
             expires_at_ms: session.expires_at_ms,
             jti: format!("jti_{}", Uuid::new_v4().simple()),
         };
-        let next_capability_token = self.signer.issue(&new_claims)?;
+        let next_capability_token = self
+            .signer
+            .issue(&new_claims)
+            .map_err(|message| SessionError::new(INTERNAL_ERROR, message))?;
 
         self.consume_delegation(&params.delegation_token)?;
         session.status = SessionStatus::Suspended;
@@ -218,103 +283,110 @@ impl SessionManager {
         }))
     }
 
-    pub fn execute_tool(&self, params: ToolCallParams) -> Result<Value, ToolError> {
+    pub fn execute_tool(&self, params: ToolCallParams) -> Result<Value, SessionError> {
         if params.meta.idempotency_key.trim().is_empty() {
-            return Err((-32602, "idempotency_key is required".to_string(), None));
+            return Err(SessionError::new(
+                INVALID_PARAMS,
+                "idempotency_key is required",
+            ));
         }
         let claims = self
             .signer
             .verify(&params.meta.capability_token)
-            .map_err(|message| (-32004, message, None))?;
+            .map_err(|message| SessionError::new(INVALID_CAPABILITY, message))?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let adapter = self.adapters.get(&params.name).cloned().ok_or_else(|| {
-            (
-                -32007,
+            SessionError::new(
+                MISSING_ADAPTER,
                 format!(
                     "Tool '{}' has no registered Settlement Adapter",
                     params.name
                 ),
-                None,
             )
         })?;
 
         let fingerprint = serde_json::to_string(&(params.name.as_str(), &params.arguments))
-            .map_err(|error| (-32602, format!("Tool arguments are invalid: {error}"), None))?;
+            .map_err(|error| {
+                SessionError::new(
+                    INVALID_PARAMS,
+                    format!("Tool arguments are invalid: {error}"),
+                )
+            })?;
         let mut sessions = self.sessions.write();
         let session = sessions.get_mut(&params.meta.session_id).ok_or_else(|| {
-            (
-                -32005,
+            SessionError::new(
+                UNKNOWN_SESSION,
                 format!("Session '{}' not found", params.meta.session_id),
-                None,
             )
         })?;
 
-        if let Err(message) =
+        if let Err(error) =
             Self::validate_capability(session, &claims, &params.meta.capability_token, now_ms)
         {
             if now_ms >= session.expires_at_ms {
                 session.status = SessionStatus::Expired;
             }
-            return Err((-32004, message, None));
+            return Err(error);
         }
         if params.meta.generation != session.generation {
-            return Err((
-                -32004,
+            return Err(SessionError::new(
+                INVALID_CAPABILITY,
                 format!(
                     "Stale capability generation: presented {}, active {}",
                     params.meta.generation, session.generation
                 ),
-                None,
             ));
         }
         if !matches!(
             session.status,
             SessionStatus::Admitted | SessionStatus::Active
         ) {
-            return Err((
-                -32008,
+            return Err(SessionError::new(
+                INVALID_LIFECYCLE,
                 format!("Tool calls are not permitted in state {:?}", session.status),
-                None,
             ));
         }
         if !session.allowed_tools.contains(&params.name) {
-            return Err((
-                -32003,
+            return Err(SessionError::new(
+                TOOL_OUTSIDE_ENVELOPE,
                 format!("Tool '{}' is outside the execution envelope", params.name),
-                None,
             ));
         }
 
         if let Some(cached) = session.tool_results.get(&params.meta.idempotency_key) {
             if cached.request_fingerprint != fingerprint {
-                return Err((
-                    -32009,
-                    "Idempotency key was already used for a different tool request".to_string(),
-                    None,
+                return Err(SessionError::new(
+                    IDEMPOTENCY_CONFLICT,
+                    "Idempotency key was already used for a different tool request",
                 ));
             }
             return Ok(cached.response.clone());
         }
 
-        let resource_id =
+        let resource_ids =
             Self::validate_resource_scope(&adapter, &params.arguments, &session.target_resources)?;
         let policy_context = Self::policy_context(&params.arguments);
-        match self.policy_engine.evaluate(
-            &session.principal,
-            &params.name,
-            &resource_id,
-            &policy_context,
-        ) {
-            PolicyOutcome::Allow => {}
-            PolicyOutcome::Deny {
-                reason,
-                violating_policies,
-            } => {
-                return Err((
-                    -32006,
-                    format!("INVARIANT_VIOLATION: {reason}"),
-                    Some(json!({ "violating_policies": violating_policies })),
-                ));
+        for resource_id in &resource_ids {
+            match self.policy_engine.evaluate(
+                &session.principal,
+                &params.name,
+                resource_id,
+                &policy_context,
+            ) {
+                PolicyOutcome::Allow => {}
+                PolicyOutcome::Deny {
+                    reason,
+                    violating_policies,
+                } => {
+                    return Err(SessionError::with_data(
+                        POLICY_VIOLATION,
+                        format!("INVARIANT_VIOLATION: {reason}"),
+                        json!({
+                            "resource_id": resource_id,
+                            "violating_policies": violating_policies
+                        }),
+                    ));
+                }
             }
         }
 
@@ -322,17 +394,17 @@ impl SessionManager {
         for (dimension, amount) in &charges {
             let remaining = session.remaining_budgets.value(dimension).unwrap_or(0);
             if remaining < *amount {
-                return Err((
-                    -32001,
+                return Err(SessionError::with_data(
+                    INSUFFICIENT_BUDGET,
                     format!(
                         "INSUFFICIENT_BUDGET: '{dimension}' requested {amount}, remaining {remaining}"
                     ),
-                    Some(json!({
+                    json!({
                         "dimension": dimension,
                         "requested": amount,
                         "remaining": remaining,
                         "remediation_hint": "Reduce the operation or use intent/amend with a fresh delegation token"
-                    })),
+                    }),
                 ));
             }
         }
@@ -340,7 +412,7 @@ impl SessionManager {
             session
                 .remaining_budgets
                 .deduct(&dimension, amount)
-                .map_err(|message| (-32001, message, None))?;
+                .map_err(|message| SessionError::new(INSUFFICIENT_BUDGET, message))?;
         }
 
         session.status = SessionStatus::Active;
@@ -349,7 +421,7 @@ impl SessionManager {
         session.staged_actions.push(StagedAction {
             tool_name: params.name,
             arguments: params.arguments,
-            resource_id,
+            resource_ids,
             adapter_name: adapter.adapter_name,
             mode: adapter.mode,
             settlement_order: adapter.settlement_order,
@@ -369,51 +441,73 @@ impl SessionManager {
         Ok(response)
     }
 
-    pub fn seal(&self, params: IntentSealParams) -> Result<Value, String> {
+    pub fn seal(&self, params: IntentSealParams) -> Result<Value, SessionError> {
         if params.idempotency_key.trim().is_empty() {
-            return Err("idempotency_key is required".to_string());
+            return Err(SessionError::new(
+                INVALID_PARAMS,
+                "idempotency_key is required",
+            ));
         }
-        let claims = self.signer.verify(&params.capability_token)?;
+        let claims = self
+            .signer
+            .verify(&params.capability_token)
+            .map_err(|message| SessionError::new(INVALID_CAPABILITY, message))?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut sessions = self.sessions.write();
-        let session = sessions
-            .get_mut(&params.session_id)
-            .ok_or_else(|| format!("Session '{}' not found", params.session_id))?;
+        let session = sessions.get_mut(&params.session_id).ok_or_else(|| {
+            SessionError::new(
+                UNKNOWN_SESSION,
+                format!("Session '{}' not found", params.session_id),
+            )
+        })?;
         Self::validate_capability(session, &claims, &params.capability_token, now_ms)?;
 
         if session.status == SessionStatus::Settled {
             if session.seal_idempotency_key.as_deref() == Some(&params.idempotency_key) {
-                return session
-                    .settlement_result
-                    .clone()
-                    .ok_or_else(|| "Settled session is missing its receipt".to_string());
+                return session.settlement_result.clone().ok_or_else(|| {
+                    SessionError::new(INTERNAL_ERROR, "Settled session is missing its receipt")
+                });
             }
-            return Err("Session is already settled under a different idempotency key".to_string());
+            return Err(SessionError::new(
+                IDEMPOTENCY_CONFLICT,
+                "Session is already settled under a different idempotency key",
+            ));
         }
         if !matches!(
             session.status,
             SessionStatus::Admitted | SessionStatus::Active
         ) {
-            return Err(format!(
-                "Session cannot be sealed from state {:?}",
-                session.status
+            return Err(SessionError::new(
+                INVALID_LIFECYCLE,
+                format!("Session cannot be sealed from state {:?}", session.status),
             ));
         }
 
         session.status = SessionStatus::Sealing;
         for action in &session.staged_actions {
             let policy_context = Self::policy_context(&action.arguments);
-            if let PolicyOutcome::Deny { reason, .. } = self.policy_engine.evaluate(
-                &session.principal,
-                &action.tool_name,
-                &action.resource_id,
-                &policy_context,
-            ) {
-                session.status = SessionStatus::Aborted;
-                session.staged_actions.clear();
-                return Err(format!(
-                    "Commit-time invariant revalidation failed: {reason}"
-                ));
+            for resource_id in &action.resource_ids {
+                if let PolicyOutcome::Deny {
+                    reason,
+                    violating_policies,
+                } = self.policy_engine.evaluate(
+                    &session.principal,
+                    &action.tool_name,
+                    resource_id,
+                    &policy_context,
+                ) {
+                    let error = SessionError::with_data(
+                        POLICY_VIOLATION,
+                        format!("Commit-time invariant revalidation failed: {reason}"),
+                        json!({
+                            "resource_id": resource_id,
+                            "violating_policies": violating_policies
+                        }),
+                    );
+                    session.status = SessionStatus::Aborted;
+                    session.staged_actions.clear();
+                    return Err(error);
+                }
             }
         }
 
@@ -432,6 +526,7 @@ impl SessionManager {
                 json!({
                     "tool": action.tool_name,
                     "adapter": action.adapter_name,
+                    "resource_ids": action.resource_ids,
                     "staged_id": action.staged_id,
                     "status": status,
                     "mode": action.mode,
@@ -448,7 +543,10 @@ impl SessionManager {
             "execution_backend": "in_memory_simulator",
             "settled_actions": settled_actions,
         });
-        let (evidence_hash, evidence_signature) = self.signer.sign_evidence(&evidence)?;
+        let (evidence_hash, evidence_signature) = self
+            .signer
+            .sign_evidence(&evidence)
+            .map_err(|message| SessionError::new(INTERNAL_ERROR, message))?;
         let result = json!({
             "session_id": session.session_id,
             "status": "SETTLED",
@@ -466,26 +564,37 @@ impl SessionManager {
         Ok(result)
     }
 
-    pub fn abort(&self, params: IntentAbortParams) -> Result<Value, String> {
+    pub fn abort(&self, params: IntentAbortParams) -> Result<Value, SessionError> {
         if params.idempotency_key.trim().is_empty() {
-            return Err("idempotency_key is required".to_string());
+            return Err(SessionError::new(
+                INVALID_PARAMS,
+                "idempotency_key is required",
+            ));
         }
-        let claims = self.signer.verify(&params.capability_token)?;
+        let claims = self
+            .signer
+            .verify(&params.capability_token)
+            .map_err(|message| SessionError::new(INVALID_CAPABILITY, message))?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut sessions = self.sessions.write();
-        let session = sessions
-            .get_mut(&params.session_id)
-            .ok_or_else(|| format!("Session '{}' not found", params.session_id))?;
+        let session = sessions.get_mut(&params.session_id).ok_or_else(|| {
+            SessionError::new(
+                UNKNOWN_SESSION,
+                format!("Session '{}' not found", params.session_id),
+            )
+        })?;
         Self::validate_capability(session, &claims, &params.capability_token, now_ms)?;
 
         if session.status == SessionStatus::Aborted {
             if session.abort_idempotency_key.as_deref() == Some(&params.idempotency_key) {
-                return session
-                    .abort_result
-                    .clone()
-                    .ok_or_else(|| "Aborted session is missing its receipt".to_string());
+                return session.abort_result.clone().ok_or_else(|| {
+                    SessionError::new(INTERNAL_ERROR, "Aborted session is missing its receipt")
+                });
             }
-            return Err("Session is already aborted under a different idempotency key".to_string());
+            return Err(SessionError::new(
+                IDEMPOTENCY_CONFLICT,
+                "Session is already aborted under a different idempotency key",
+            ));
         }
         if !matches!(
             session.status,
@@ -494,9 +603,9 @@ impl SessionManager {
                 | SessionStatus::Suspended
                 | SessionStatus::Sealing
         ) {
-            return Err(format!(
-                "Session cannot be aborted from state {:?}",
-                session.status
+            return Err(SessionError::new(
+                INVALID_LIFECYCLE,
+                format!("Session cannot be aborted from state {:?}", session.status),
             ));
         }
 
@@ -508,6 +617,7 @@ impl SessionManager {
                 json!({
                     "tool": action.tool_name,
                     "adapter": action.adapter_name,
+                    "resource_ids": action.resource_ids,
                     "staged_id": action.staged_id,
                     "status": "SIMULATED_REVERTED",
                     "rollback_strategy": action.rollback_strategy,
@@ -536,26 +646,38 @@ impl SessionManager {
         claims: &CapabilityClaims,
         presented_token: &str,
         now_ms: i64,
-    ) -> Result<(), String> {
+    ) -> Result<(), SessionError> {
         if presented_token != session.capability_token {
-            return Err("Capability token is not active for this session".to_string());
+            return Err(SessionError::new(
+                INVALID_CAPABILITY,
+                "Capability token is not active for this session",
+            ));
         }
         if claims.session_id != session.session_id
             || claims.tenant_id != session.tenant_id
             || claims.principal != session.principal
             || claims.generation != session.generation
         {
-            return Err("Capability claims do not match the active session".to_string());
+            return Err(SessionError::new(
+                INVALID_CAPABILITY,
+                "Capability claims do not match the active session",
+            ));
         }
         if claims.expires_at_ms != session.expires_at_ms || now_ms >= session.expires_at_ms {
-            return Err("Capability and session have expired".to_string());
+            return Err(SessionError::new(
+                INVALID_CAPABILITY,
+                "Capability and session have expired",
+            ));
         }
         Ok(())
     }
 
-    fn consume_delegation(&self, token: &str) -> Result<(), String> {
+    fn consume_delegation(&self, token: &str) -> Result<(), SessionError> {
         if !self.used_delegations.lock().insert(token.to_string()) {
-            return Err("Delegation token has already been consumed".to_string());
+            return Err(SessionError::new(
+                INVALID_DELEGATION,
+                "Delegation token has already been consumed",
+            ));
         }
         Ok(())
     }
@@ -564,93 +686,95 @@ impl SessionManager {
         adapter: &RegisteredTool,
         arguments: &Value,
         target_resources: &[String],
-    ) -> Result<String, ToolError> {
+    ) -> Result<Vec<String>, SessionError> {
         if adapter.resource_arguments.is_empty() {
-            return Ok(target_resources
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "unscoped".to_string()));
+            return Ok(vec!["unscoped".to_string()]);
         }
 
-        let mut first_match = None;
+        let mut matched_resources = Vec::new();
         for resource_argument in &adapter.resource_arguments {
             let resource_value = arguments
                 .get(&resource_argument.argument)
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    (
-                        -32002,
+                    SessionError::new(
+                        RESOURCE_OUTSIDE_ENVELOPE,
                         format!(
                             "Required resource argument '{}' is missing",
                             resource_argument.argument
                         ),
-                        None,
                     )
                 })?;
             let qualified_resource =
                 format!("{}:{}", resource_argument.scope_prefix, resource_value);
-            let matching_scope = target_resources.iter().find(|scope| {
-                scope.as_str() == resource_value || scope.as_str() == qualified_resource
-            });
+            let matching_scope = target_resources
+                .iter()
+                .find(|scope| scope.as_str() == qualified_resource);
             let matching_scope = matching_scope.ok_or_else(|| {
-                (
-                    -32002,
+                SessionError::with_data(
+                    RESOURCE_OUTSIDE_ENVELOPE,
                     format!(
                         "Resource '{qualified_resource}' from '{}' is outside the execution envelope",
                         resource_argument.argument
                     ),
-                    Some(json!({ "allowed_resources": target_resources })),
+                    json!({ "allowed_resources": target_resources }),
                 )
             })?;
-            if first_match.is_none() {
-                first_match = Some(matching_scope.clone());
+            if !matched_resources.contains(matching_scope) {
+                matched_resources.push(matching_scope.clone());
             }
         }
 
-        Ok(first_match.unwrap_or_else(|| "unscoped".to_string()))
+        Ok(matched_resources)
     }
 
     fn calculate_budget_charges(
         adapter: &RegisteredTool,
         arguments: &Value,
-    ) -> Result<Vec<(String, u64)>, ToolError> {
-        let mut charges = Vec::new();
+    ) -> Result<Vec<(String, u64)>, SessionError> {
+        let mut charges: HashMap<String, u64> = HashMap::new();
         for charge in &adapter.budget_charges {
             let amount = if let Some(argument_name) = &charge.argument {
                 arguments
                     .get(argument_name)
                     .and_then(Value::as_u64)
                     .ok_or_else(|| {
-                        (
-                            -32602,
+                        SessionError::new(
+                            INVALID_PARAMS,
                             format!(
                                 "Budgeted argument '{argument_name}' must be a non-negative integer minor-unit value"
                             ),
-                            None,
                         )
                     })?
             } else {
                 charge.constant.ok_or_else(|| {
-                    (
-                        -32603,
+                    SessionError::new(
+                        INTERNAL_ERROR,
                         format!(
                             "Adapter budget charge '{}' has neither argument nor constant",
                             charge.dimension
                         ),
-                        None,
                     )
                 })?
             };
-            charges.push((charge.dimension.clone(), amount));
+            let total = charges.get(&charge.dimension).copied().unwrap_or(0);
+            charges.insert(
+                charge.dimension.clone(),
+                total.checked_add(amount).ok_or_else(|| {
+                    SessionError::new(
+                        INTERNAL_ERROR,
+                        format!("Adapter budget charge '{}' overflowed", charge.dimension),
+                    )
+                })?,
+            );
         }
-        Ok(charges)
+        Ok(charges.into_iter().collect())
     }
 
     fn policy_context(arguments: &Value) -> Value {
         let mut context = arguments.as_object().cloned().unwrap_or_else(Map::new);
-        context
-            .entry("has_director_approval".to_string())
-            .or_insert(Value::Bool(false));
+        context.insert("clared_envelope_admitted".to_string(), Value::Bool(true));
+        context.insert("has_director_approval".to_string(), Value::Bool(false));
         Value::Object(context)
     }
 
@@ -690,6 +814,7 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::{BudgetCharge, ResourceArgument};
     use crate::crypto::CapabilitySigner;
     use crate::delegation::issue_delegation_token;
     use crate::protocol::ToolCallMeta;
@@ -804,6 +929,90 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_tool_arguments_cannot_assert_director_approval() {
+        let (manager, _) = manager();
+        let result = propose(&manager, 1);
+        let error = manager
+            .execute_tool(ToolCallParams {
+                name: "stripe.payment_intents.create".to_string(),
+                arguments: json!({
+                    "amount_minor": 60000,
+                    "customer_id": "cus_9918",
+                    "has_director_approval": true
+                }),
+                meta: call_meta(&result, "forged-director-approval"),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, POLICY_VIOLATION);
+    }
+
+    #[test]
+    fn every_adapter_resource_is_returned_for_policy_evaluation() {
+        let adapter = RegisteredTool {
+            adapter_name: "multi_resource_test".to_string(),
+            mode: ExecutionMode::Mode2Mock,
+            resource_arguments: vec![
+                ResourceArgument {
+                    argument: "order_id".to_string(),
+                    scope_prefix: "order".to_string(),
+                },
+                ResourceArgument {
+                    argument: "customer_id".to_string(),
+                    scope_prefix: "customer".to_string(),
+                },
+            ],
+            budget_charges: Vec::<BudgetCharge>::new(),
+            settlement_order: 10,
+            staging_strategy: "MOCK".to_string(),
+            settlement_strategy: "MOCK".to_string(),
+            rollback_strategy: "MOCK".to_string(),
+        };
+        let resources = SessionManager::validate_resource_scope(
+            &adapter,
+            &json!({"order_id": "ord_1042", "customer_id": "cus_9918"}),
+            &[
+                "order:ord_1042".to_string(),
+                "customer:cus_9918".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            resources,
+            vec![
+                "order:ord_1042".to_string(),
+                "customer:cus_9918".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_adapter_budget_dimensions_are_aggregated_before_deduction() {
+        let adapter = RegisteredTool {
+            adapter_name: "aggregate_budget_test".to_string(),
+            mode: ExecutionMode::Mode2Mock,
+            resource_arguments: Vec::new(),
+            budget_charges: vec![
+                BudgetCharge {
+                    dimension: "actions.count".to_string(),
+                    argument: None,
+                    constant: Some(2),
+                },
+                BudgetCharge {
+                    dimension: "actions.count".to_string(),
+                    argument: None,
+                    constant: Some(3),
+                },
+            ],
+            settlement_order: 10,
+            staging_strategy: "MOCK".to_string(),
+            settlement_strategy: "MOCK".to_string(),
+            rollback_strategy: "MOCK".to_string(),
+        };
+        let charges = SessionManager::calculate_budget_charges(&adapter, &json!({})).unwrap();
+        assert_eq!(charges, vec![("actions.count".to_string(), 5)]);
+    }
+
+    #[test]
     fn budgets_and_tool_idempotency_are_enforced() {
         let (manager, _) = manager();
         let result = propose(&manager, 1);
@@ -872,6 +1081,10 @@ mod tests {
         assert_eq!(
             receipt["settled_actions"][0]["tool"],
             "postgres.orders.update"
+        );
+        assert_eq!(
+            receipt["settled_actions"][0]["resource_ids"][0],
+            "order:ord_1042"
         );
         assert_eq!(
             receipt["settled_actions"][1]["tool"],
@@ -964,6 +1177,38 @@ mod tests {
             ttl_ms: 30_000,
         };
         manager.propose(params.clone()).unwrap();
-        assert!(manager.propose(params).is_err());
+        let error = manager.propose(params).unwrap_err();
+        assert_eq!(error.code, INVALID_DELEGATION);
+    }
+
+    #[test]
+    fn terminal_errors_use_protocol_registry_codes() {
+        let (manager, _) = manager();
+        let result = propose(&manager, 1);
+        manager
+            .seal(IntentSealParams {
+                session_id: result.session_id.clone(),
+                capability_token: result.capability_token.clone(),
+                idempotency_key: "seal-original".to_string(),
+            })
+            .unwrap();
+
+        let conflict = manager
+            .seal(IntentSealParams {
+                session_id: result.session_id.clone(),
+                capability_token: result.capability_token.clone(),
+                idempotency_key: "seal-conflict".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(conflict.code, IDEMPOTENCY_CONFLICT);
+
+        let unknown = manager
+            .seal(IntentSealParams {
+                session_id: "ses_missing".to_string(),
+                capability_token: result.capability_token,
+                idempotency_key: "seal-missing".to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(unknown.code, UNKNOWN_SESSION);
     }
 }

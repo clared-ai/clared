@@ -46,31 +46,11 @@ jobs:
     name: Fault Injection Demo
     runs-on: ubuntu-latest
     needs: [test-rust, test-python]
-    env:
-      CLARED_DELEGATION_SECRET: 0123456789abcdef0123456789abcdef
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - name: Install Python client
-        run: pip install ./clared-python
-      - name: Build reference server
-        working-directory: clared-core
-        run: cargo build
-      - name: Run fault-injection demo
-        run: |
-          ./clared-core/target/debug/clared-guard > /tmp/clared-server.log 2>&1 &
-          server_pid=$!
-          trap 'kill "$server_pid"' EXIT
-          python -c 'import socket,time
-          for _ in range(50):
-              try:
-                  socket.create_connection(("127.0.0.1", 4000), timeout=0.1).close()
-                  break
-              except OSError:
-                  time.sleep(0.1)
-          else:
-              raise SystemExit("Clared server did not start")'
-          python examples/fault_injection_demo.py
+      - name: Run one-command fault-injection demo
+        run: make demo

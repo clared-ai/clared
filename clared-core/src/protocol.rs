@@ -2,6 +2,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+pub mod error_code {
+    pub const INVALID_PARAMS: i32 = -32602;
+    pub const INTERNAL_ERROR: i32 = -32603;
+    pub const INSUFFICIENT_BUDGET: i32 = -32001;
+    pub const RESOURCE_OUTSIDE_ENVELOPE: i32 = -32002;
+    pub const TOOL_OUTSIDE_ENVELOPE: i32 = -32003;
+    pub const INVALID_CAPABILITY: i32 = -32004;
+    pub const UNKNOWN_SESSION: i32 = -32005;
+    pub const POLICY_VIOLATION: i32 = -32006;
+    pub const MISSING_ADAPTER: i32 = -32007;
+    pub const INVALID_LIFECYCLE: i32 = -32008;
+    pub const IDEMPOTENCY_CONFLICT: i32 = -32009;
+    pub const INVALID_DELEGATION: i32 = -32010;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,

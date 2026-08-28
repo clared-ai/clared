@@ -12,4 +12,4 @@ pub use delegation::issue_delegation_token;
 pub use policy::{CedarEngine, PolicyOutcome};
 pub use protocol::*;
 pub use server::create_router;
-pub use session::{SessionManager, StagedAction};
+pub use session::{SessionError, SessionManager, StagedAction};

@@ -22,12 +22,20 @@ impl CedarEngine {
     /// Creates a new Cedar engine with default guardrail policies.
     pub fn new() -> Result<Self, String> {
         let default_policies = r#"
-            // Allow all actions by default unless explicitly forbidden
+            // Default deny. Only adapted actions admitted by the execution
+            // envelope receive a base permit.
             permit(
                 principal,
-                action,
+                action in [
+                    Action::"postgres.orders.update",
+                    Action::"stripe.payment_intents.create",
+                    Action::"twilio.messages.create"
+                ],
                 resource
-            );
+            )
+            when {
+                context.clared_envelope_admitted
+            };
 
             // Invariant 1: Forbid high-value refund captures exceeding $500.00 without director approval
             forbid(
@@ -163,17 +171,18 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_cedar_refund_budget_invariant() {
+    fn test_cedar_payment_budget_invariant() {
         let engine = CedarEngine::new().expect("Engine should compile default policies");
 
-        // Allowed $450 refund
+        // Allowed $450 adapted payment action inside an admitted envelope.
         let allowed_ctx = json!({
             "amount_minor": 45000,
-            "has_director_approval": false
+            "has_director_approval": false,
+            "clared_envelope_admitted": true
         });
         let res = engine.evaluate(
             "alice",
-            "stripe.payment_intents.refund",
+            "stripe.payment_intents.create",
             "customer:cus_9918",
             &allowed_ctx,
         );
@@ -182,15 +191,33 @@ mod tests {
         // Forbidden $600 refund without director approval
         let forbidden_ctx = json!({
             "amount_minor": 60000,
-            "has_director_approval": false
+            "has_director_approval": false,
+            "clared_envelope_admitted": true
         });
         let res2 = engine.evaluate(
             "alice",
-            "stripe.payment_intents.refund",
+            "stripe.payment_intents.create",
             "customer:cus_9918",
             &forbidden_ctx,
         );
         assert!(matches!(res2, PolicyOutcome::Deny { .. }));
+    }
+
+    #[test]
+    fn test_cedar_denies_adapted_action_without_envelope_admission() {
+        let engine = CedarEngine::new().expect("Engine should compile");
+        let ctx = json!({
+            "amount_minor": 1000,
+            "has_director_approval": false,
+            "clared_envelope_admitted": false
+        });
+        let result = engine.evaluate(
+            "alice",
+            "stripe.payment_intents.create",
+            "customer:cus_9918",
+            &ctx,
+        );
+        assert!(matches!(result, PolicyOutcome::Deny { .. }));
     }
 
     #[test]
