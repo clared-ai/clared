@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-rust:
+    name: Rust Core Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run Cargo Tests
+        working-directory: clared-core
+        run: cargo test --verbose
+
+  test-python:
+    name: Python SDK Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        working-directory: clared-python
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest httpx pydantic .
+      - name: Run Pytest
+        working-directory: clared-python
+        run: pytest -v

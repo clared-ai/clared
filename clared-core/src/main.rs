@@ -1,85 +1,30 @@
-use std::io::{self, BufRead, Write};
-use clared_core::{EpochSession, JsonRpcRequest, JsonRpcResponse, JsonRpcError, PolicyEngine};
-use serde_json::json;
+use clared_core::{create_router, CedarEngine, SessionManager};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("🛡️  Clared Guard (DTBE Proxy) v0.1.0 starting...");
-    eprintln!("    • Mode: In-Process Decision Graph + Egress Escrow");
-    eprintln!("    • Wire Protocol: Model Context Protocol (MCP) JSON-RPC 2.0");
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
-    let policy_engine = PolicyEngine::new("default_policy_bundle");
-    let session = EpochSession::new("acme_default");
+    eprintln!("Clared Guard (Execution Proxy) v0.1.0 starting...");
+    eprintln!("  • Mode: In-Memory Cedar DAG + Two-Phase Staging Gateway");
+    eprintln!("  • Protocol: JSON-RPC 2.0 (Execution Envelope Spec)");
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+    let policy_engine = Arc::new(CedarEngine::new().map_err(|e| format!("Failed to load Cedar policies: {}", e))?);
+    let session_manager = Arc::new(SessionManager::new(policy_engine));
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+    let app = create_router(session_manager);
 
-        if line.trim().is_empty() {
-            continue;
-        }
+    let port = std::env::var("PORT").unwrap_or_else(|_| "4000".to_string()).parse::<u16>().unwrap_or(4000);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    eprintln!("  • Listening on: http://{}", addr);
 
-        // Parse MCP JSON-RPC Request
-        if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&line) {
-            if req.method == "tools/call" {
-                if let Some(params) = req.params {
-                    let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-
-                    // Process through Clared Escrow
-                    match session.intercept_tool_call(tool_name, &arguments, &policy_engine) {
-                        Ok(escrow_result) => {
-                            let resp = JsonRpcResponse {
-                                jsonrpc: "2.0".to_string(),
-                                id: req.id,
-                                result: Some(json!({
-                                    "content": [{
-                                        "type": "text",
-                                        "text": escrow_result.to_string()
-                                    }]
-                                })),
-                                error: None,
-                            };
-                            let out = serde_json::to_string(&resp)?;
-                            writeln!(stdout, "{}", out)?;
-                            stdout.flush()?;
-                        }
-                        Err(err_msg) => {
-                            let resp = JsonRpcResponse {
-                                jsonrpc: "2.0".to_string(),
-                                id: req.id,
-                                result: None,
-                                error: Some(JsonRpcError {
-                                    code: -32001,
-                                    message: format!("CLRED_INVARIANT_BREACH: {}", err_msg),
-                                    data: Some(json!({ "epoch_id": session.epoch_id })),
-                                }),
-                            };
-                            let out = serde_json::to_string(&resp)?;
-                            writeln!(stdout, "{}", out)?;
-                            stdout.flush()?;
-                        }
-                    }
-                }
-            } else {
-                // Pass-through other MCP methods (e.g. tools/list, initialize)
-                let resp = JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: req.id,
-                    result: Some(json!({ "status": "PASSTHROUGH_ACK" })),
-                    error: None,
-                };
-                let out = serde_json::to_string(&resp)?;
-                writeln!(stdout, "{}", out)?;
-                stdout.flush()?;
-            }
-        }
-    }
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }

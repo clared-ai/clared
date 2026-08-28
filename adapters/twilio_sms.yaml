@@ -1,0 +1,26 @@
+version: "openadapter/v1"
+metadata:
+  name: "twilio_sms_adapter"
+  description: "Topological egress sink adapter for Twilio SMS"
+  provider: "twilio"
+  version: "1.0.0"
+
+targets:
+  - tool_name: "twilio.messages.create"
+    http_route: "POST /2010-04-01/Accounts/{AccountSid}/Messages.json"
+
+mode: EGRESS_SINK
+
+execution:
+  staging:
+    strategy: RAM_BUFFER
+    response_extract:
+      virtual_token_prefix: "sms_staged"
+
+  settlement:
+    strategy: DISPATCH_BUFFER
+    http_method: POST
+    endpoint: "/2010-04-01/Accounts/{{account_sid}}/Messages.json"
+
+  rollback:
+    strategy: DISCARD_BUFFER

@@ -1,0 +1,39 @@
+version: "openadapter/v1"
+metadata:
+  name: "stripe_payment_intent_adapter"
+  description: "Two-phase reservation adapter for Stripe PaymentIntents"
+  provider: "stripe"
+  version: "1.0.0"
+
+targets:
+  - tool_name: "stripe.payment_intents.create"
+    http_route: "POST /v1/payment_intents"
+
+mode: MODE_3_RESERVATION
+
+execution:
+  staging:
+    strategy: AUTH_HOLD
+    request_transform:
+      set_fields:
+        capture_method: "manual"
+    response_extract:
+      entity_id_path: "$.id"
+
+  settlement:
+    strategy: ATOMIC_CAPTURE
+    http_method: POST
+    endpoint: "/v1/payment_intents/{{staged_entity_id}}/capture"
+
+  rollback:
+    strategy: CANCEL_AUTH
+    http_method: POST
+    endpoint: "/v1/payment_intents/{{staged_entity_id}}/cancel"
+
+  compensation:
+    strategy: ARCHIVE_INCIDENT
+    http_method: POST
+    endpoint: "/v1/refunds"
+    body:
+      payment_intent: "{{staged_entity_id}}"
+      reason: "duplicate"

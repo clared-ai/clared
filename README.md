@@ -1,127 +1,128 @@
 # Clared
 
-Commit-time authorization and safe-execution proxy for AI agents.
+> **Status:** Experimental reference implementation for safe multi-step agent execution. Seeking reviews, fault-injection attacks, and feedback.
 
-Clared sits between agent frameworks (such as LangGraph or CrewAI) and target tools. It intercepts tool calls, checks Cedar policies in memory, manages database transaction savepoints, reserves API holds, and settles multi-step operations safely.
+Clared is an execution proxy and middleware for autonomous AI agents. It intercepts tool calls, evaluates policy invariants in memory, manages database transaction savepoints, reserves API holds, and settles multi-step operations safely.
 
-## Why this exists
+## The core problem: Multi-step execution safety
 
-Prompt guardrails check what an agent says. Clared checks what an agent does at the moment of execution.
+Most agent authorization tools check permissions per call. But in multi-step workflows, **individually authorized actions can still produce an unsafe aggregate outcome.**
 
-If an agent attempts three operations (such as a database edit, a Stripe refund, and a customer email) and crashes on step two, standard setups leave the database updated and the payment in limbo. Clared holds changes in staging, commits the database only when the workflow succeeds, and cancels uncommitted holds if the run aborts.
+Consider an agent resolving a customer dispute:
+1. **Step 1**: It queries an order database (allowed).
+2. **Step 2**: It updates the database record to `status = 'refunded'` (allowed).
+3. **Step 3**: It calls Stripe to issue a $500 refund (allowed).
+4. **Step 4**: It calls Twilio to send a confirmation SMS (allowed).
 
-## Key mechanics
+If the model crashes, gets injected, or hits a network partition on Step 3, the database is updated, the refund is unissued, and the user receives no notification.
 
-- **In-memory policy evaluation**: Evaluates AWS Cedar policies in native Rust memory before requests touch the network.
-- **Connection-pinned database transactions**: Runs database writes inside a pinned `BEGIN ... SAVEPOINT` transaction, giving the agent read-your-own-writes visibility while protecting the main database from unsealed changes.
-- **Two-phase reservations**: Uses API hold features (such as `capture_method=manual` in Stripe) to verify parameters and obtain IDs without moving money until seal time.
-- **Write-ahead log for budgets**: Tracks multi-dimensional budgets in minor units (`money.minor.USD: 50000`) on a local write-ahead log to survive container crashes and prevent over-spending.
-- **Topological sink buffering**: Delays notification tools (SMS, email, webhooks) in memory until all database writes and payment captures succeed.
+Traditional gateways cannot fix this because they do not coordinate state across steps.
 
-## Quick start
+## How Clared works
 
-### 1. Python / LangGraph wrapper
+Clared manages the entire agent trajectory as a bounded execution session:
 
-Install the SDK:
-
-```bash
-pip install clared
+```
+Agent Runtime (LangGraph / Python)
+          │
+          │ 1. `intent/propose` (Declares aggregate budgets & resource targets)
+          ▼
+┌────────────────────────────────────────────────────────┐
+│                      Clared Proxy                      │
+│                                                        │
+│  - In-Memory Policy Evaluation (<0.2ms)                │
+│  - Minor-Unit Integer Budgets (money.minor.USD: 50000) │
+│  - Generation Fencing (`gen: 1 -> gen: 2`)             │
+└──────────────┬──────────────────────────┬──────────────┘
+               │                          │
+   2. Tools Call (Staging)    3. `intent/seal` (Settlement)
+               ▼                          ▼
+┌──────────────────────────────┐   ┌────────────────────────────────┐
+│       STAGING PRIMITIVES     │   │     COORDINATED SETTLEMENT     │
+│ • Database: Pinned Tx BEGIN  │──►│ 1. Capture Stripe Hold         │
+│ • Stripe: Auth Hold (Manual) │   │ 2. Commit Database Tx          │
+│ • Twilio: RAM Buffer         │   │ 3. Flush Buffered Notifications│
+└──────────────────────────────┘   └────────────────────────────────┘
 ```
 
-Wrap an existing agent workflow:
+1. **Aggregate multi-dimensional budgets**: Tracks integer minor-unit limits (such as `50000` for $500.00) in memory. Floating-point values are prohibited.
+2. **Connection-pinned database transactions (Mode 1)**: Pins a database connection and executes `BEGIN ... SAVEPOINT`. The agent sees its own writes, while the production database remains protected until seal.
+3. **Two-phase reservations (Mode 3)**: Uses API hold features (such as `capture_method=manual` in Stripe) to get genuine provider IDs without settling funds.
+4. **Topological sink buffering**: Holds user-facing notifications (SMS, email, Slack) in RAM until all database writes and payment captures succeed.
+5. **Explicit partial outcome reporting**: If an unrecoverable failure occurs during settlement, Clared marks the session as `PARTIALLY_SETTLED`, executes declared compensators, and emits a signed incident receipt.
+
+---
+
+## Repository layout
+
+```
+.
+├── clared-core/           # Rust execution proxy & policy engine
+├── clared-python/         # Python / LangGraph harness middleware
+├── adapters/              # Declarative YAML adapters (Stripe, Postgres, Twilio)
+├── docs/                  # Reference specifications
+│   ├── execution-envelope-spec.md
+│   └── settlement-adapters-spec.md
+└── examples/              # End-to-end runnable integration examples
+```
+
+---
+
+## Local development
+
+### Prerequisites
+- Rust 1.75+ (`cargo`)
+- Python 3.10+
+
+### Build the Rust proxy
+```bash
+cd clared-core
+cargo build --release
+cargo test
+```
+
+### Install the Python SDK locally
+```bash
+cd clared-python
+pip install -e .
+```
+
+---
+
+## Python / LangGraph middleware example
 
 ```python
 from clared import protect_agent
 from my_agent import billing_graph
 
-# Protect an existing LangGraph instance
+# Wrap an existing LangGraph or Python callable
 safe_agent = protect_agent(
     billing_graph,
     sidecar_url="http://localhost:4000",
     budget={
-        "money.minor.USD.capture": 50000,
+        "money.minor.USD.capture": 50000,   # $500.00 max
         "database.mutations.count": 5
     },
     allowed_tools=[
         "stripe.payment_intents.refund",
         "postgres.orders.update"
-    ]
+    ],
+    target_resources=["customer:cus_9918"]
 )
 
 # Run the agent normally
 result = await safe_agent.invoke({"dispute_id": "1042"})
 ```
 
-### 2. Standalone MCP proxy (CLI)
+---
 
-Run Clared in shadow mode to log policy evaluations without blocking actions:
+## Specifications
 
-```bash
-clared-guard --mode shadow --policy-file ./policies.cedar -- npx @modelcontextprotocol/server-postgres
-```
+- [Execution Envelope Specification](docs/execution-envelope-spec.md)
+- [Settlement Adapters Specification](docs/settlement-adapters-spec.md)
 
-Run in enforcement mode:
-
-```bash
-clared-guard --mode enforce --policy-file ./policies.cedar -- npx @modelcontextprotocol/server-postgres
-```
-
-## Example policy (`policies.cedar`)
-
-```cedar
-// Forbid refunds over $500 without manager flag
-forbid (
-    principal in Role::"AutonomousAgent",
-    action == Action::"stripe.payment_intents.refund",
-    resource
-)
-when {
-    context.amount_minor > 50000 && !context.has_manager_approval
-};
-
-// Ensure tenant isolation
-permit (
-    principal,
-    action,
-    resource
-)
-when {
-    principal.tenant_id == resource.tenant_id
-};
-```
-
-## Architecture
-
-```
-Agent Runtime (LangGraph / Python)
-          │
-          │ (AIP Protocol / Stdio / HTTP)
-          ▼
-┌────────────────────────────────────────┐
-│             Clared Guard               │
-│                                        │
-│  - Cedar Policy DAG (<0.2ms check)     │
-│  - NVMe Write-Ahead Log (WAL)          │
-│  - OpenAdapter Tool Staging            │
-└──────────────────┬─────────────────────┘
-                   │
-         ┌─────────┴─────────┐
-         ▼                   ▼
-   PostgreSQL DB       Stripe / REST APIs
- (Pinned Connection)   (Auth-and-Hold / Sinks)
-```
-
-## Development
-
-Build the Rust gateway from source:
-
-```bash
-git clone https://github.com/clared-ai/clared.git
-cd clared/clared-core
-cargo build --release
-cargo test
-```
+---
 
 ## License
 
-Apache-2.0
+Apache-2.0. See [LICENSE](LICENSE) for details.

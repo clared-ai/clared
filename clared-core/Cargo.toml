@@ -2,13 +2,15 @@
 name = "clared-core"
 version = "0.1.0"
 edition = "2021"
-description = "Deterministic Temporal Boundary Enclave & MCP Tool Egress Gateway for Autonomous AI Agents"
+description = "Safe-Execution Proxy & Commit-Time Authorization Enclave for AI Agents"
 authors = ["Clared Team <hello@clared.ai>"]
 license = "Apache-2.0"
 
 [dependencies]
 # Async Runtime & Networking
 tokio = { version = "1.38", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 async-trait = "0.1"
@@ -17,18 +19,14 @@ async-trait = "0.1"
 cedar-policy = "3.2"
 
 # High-Performance Concurrency & Memory
-arc-swap = "1.7"
-uuid = { version = "1.8", features = ["v4", "fast-rng"] }
 parking_lot = "0.12"
+uuid = { version = "1.8", features = ["v4", "fast-rng"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
 
-# Storage Spillover
-rocksdb = { version = "0.22", optional = true }
-
-[features]
-default = []
-rocksdb-storage = ["dep:rocksdb"]
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
 
 [[bin]]
 name = "clared-guard"

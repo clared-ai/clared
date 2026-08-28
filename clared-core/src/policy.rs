@@ -1,50 +1,181 @@
-use std::sync::Arc;
+use cedar_policy::{
+    Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request, Response,
+};
 use serde_json::Value;
+use std::str::FromStr;
 
-pub struct PolicyEngine {
-    // In-memory policy store (placeholder for compiled Cedar PolicySet)
-    policy_bundle_name: String,
+pub struct CedarEngine {
+    policy_set: PolicySet,
+    authorizer: Authorizer,
 }
 
 #[derive(Debug, Clone)]
-pub enum PolicyDecision {
+pub enum PolicyOutcome {
     Allow,
-    Deny { reason: String },
+    Deny {
+        violating_policies: Vec<String>,
+        reason: String,
+    },
 }
 
-impl PolicyEngine {
-    pub fn new(bundle_name: &str) -> Self {
-        Self {
-            policy_bundle_name: bundle_name.to_string(),
-        }
+impl CedarEngine {
+    /// Creates a new Cedar engine with default guardrail policies.
+    pub fn new() -> Result<Self, String> {
+        let default_policies = r#"
+            // Allow all actions by default unless explicitly forbidden
+            permit(
+                principal,
+                action,
+                resource
+            );
+
+            // Invariant 1: Forbid high-value refund captures exceeding $500.00 without director approval
+            forbid(
+                principal,
+                action in [
+                    Action::"stripe.payment_intents.refund",
+                    Action::"stripe.payment_intents.create",
+                    Action::"stripe.charges.create"
+                ],
+                resource
+            )
+            when {
+                context.amount_minor > 50000 && !context.has_director_approval
+            };
+
+            // Invariant 2: Forbid destructive SQL DDL operations
+            forbid(
+                principal,
+                action in [
+                    Action::"db.drop_table",
+                    Action::"db.truncate",
+                    Action::"postgres.drop_table"
+                ],
+                resource
+            );
+        "#;
+
+        Self::from_policy_str(default_policies)
     }
 
-    pub fn evaluate(&self, tool_name: &str, arguments: &Value, tenant_id: &str) -> PolicyDecision {
-        // High-speed deterministic rule evaluation (<0.1ms)
-        
-        // Invariant 1: Threshold checks for charges
-        if tool_name.contains("charge") || tool_name.contains("payment") {
-            if let Some(amount) = arguments.get("amount").and_then(|v| v.as_f64()) {
-                if amount > 5000.0 {
-                    return PolicyDecision::Deny {
-                        reason: format!("Charge of ${:.2} exceeds maximum unauthorized threshold ($5,000.00)", amount),
-                    };
+    /// Compiles a Cedar policy set from a raw string.
+    pub fn from_policy_str(policy_str: &str) -> Result<Self, String> {
+        let policy_set = PolicySet::from_str(policy_str)
+            .map_err(|e| format!("Cedar policy compilation error: {}", e))?;
+        let authorizer = Authorizer::new();
+
+        Ok(Self {
+            policy_set,
+            authorizer,
+        })
+    }
+
+    /// Evaluates an action, principal, resource, and context against the compiled Cedar DAG.
+    pub fn evaluate(
+        &self,
+        principal_id: &str,
+        action_name: &str,
+        resource_id: &str,
+        context_json: &Value,
+    ) -> PolicyOutcome {
+        let principal = EntityUid::from_str(&format!("User::\"{}\"", principal_id))
+            .unwrap_or_else(|_| EntityUid::from_str("User::\"anonymous\"").unwrap());
+
+        let action = EntityUid::from_str(&format!("Action::\"{}\"", action_name))
+            .unwrap_or_else(|_| EntityUid::from_str("Action::\"unknown\"").unwrap());
+
+        let resource = EntityUid::from_str(&format!("Resource::\"{}\"", resource_id))
+            .unwrap_or_else(|_| EntityUid::from_str("Resource::\"default\"").unwrap());
+
+        // Construct Cedar context from JSON arguments
+        let context = Context::from_json_value(context_json.clone(), None)
+            .unwrap_or_else(|_| Context::empty());
+
+        let entities = Entities::empty();
+
+        let request = match Request::new(
+            Some(principal),
+            Some(action),
+            Some(resource),
+            context,
+            None,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                return PolicyOutcome::Deny {
+                    violating_policies: vec!["MALFORMED_REQUEST".to_string()],
+                    reason: format!("Failed to construct Cedar request: {}", e),
+                };
+            }
+        };
+
+        let response: Response = self.authorizer.is_authorized(&request, &self.policy_set, &entities);
+
+        match response.decision() {
+            Decision::Allow => PolicyOutcome::Allow,
+            Decision::Deny => {
+                let diagnostics = response.diagnostics();
+                let reasons: Vec<String> = diagnostics
+                    .reason()
+                    .map(|r| r.to_string())
+                    .collect();
+
+                let desc = if reasons.is_empty() {
+                    "Action denied by default closed-world policy boundary".to_string()
+                } else {
+                    format!("Violated policy: {}", reasons.join(", "))
+                };
+
+                PolicyOutcome::Deny {
+                    violating_policies: reasons,
+                    reason: desc,
                 }
             }
         }
+    }
+}
 
-        // Invariant 2: Database destructive mutations
-        if tool_name.contains("sql") || tool_name.contains("postgres") {
-            if let Some(query) = arguments.get("query").and_then(|v| v.as_str()) {
-                let upper = query.to_uppercase();
-                if upper.contains("DROP TABLE") || upper.contains("TRUNCATE") {
-                    return PolicyDecision::Deny {
-                        reason: "Destructive DDL operations (DROP/TRUNCATE) are forbidden for autonomous agents".to_string(),
-                    };
-                }
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-        PolicyDecision::Allow
+    #[test]
+    fn test_cedar_refund_budget_invariant() {
+        let engine = CedarEngine::new().expect("Engine should compile default policies");
+
+        // Allowed $450 refund
+        let allowed_ctx = json!({
+            "amount_minor": 45000,
+            "has_director_approval": false
+        });
+        let res = engine.evaluate(
+            "alice",
+            "stripe.payment_intents.refund",
+            "customer:cus_9918",
+            &allowed_ctx,
+        );
+        assert!(matches!(res, PolicyOutcome::Allow));
+
+        // Forbidden $600 refund without director approval
+        let forbidden_ctx = json!({
+            "amount_minor": 60000,
+            "has_director_approval": false
+        });
+        let res2 = engine.evaluate(
+            "alice",
+            "stripe.payment_intents.refund",
+            "customer:cus_9918",
+            &forbidden_ctx,
+        );
+        assert!(matches!(res2, PolicyOutcome::Deny { .. }));
+    }
+
+    #[test]
+    fn test_cedar_destructive_ddl_invariant() {
+        let engine = CedarEngine::new().expect("Engine should compile");
+        let ctx = json!({});
+        let res = engine.evaluate("alice", "db.drop_table", "postgres:public", &ctx);
+        assert!(matches!(res, PolicyOutcome::Deny { .. }));
     }
 }
