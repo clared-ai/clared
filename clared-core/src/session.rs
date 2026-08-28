@@ -501,7 +501,7 @@ impl SessionManager {
         }
 
         let mut rollback_plan: Vec<&StagedAction> = session.staged_actions.iter().collect();
-        rollback_plan.sort_by(|left, right| right.settlement_order.cmp(&left.settlement_order));
+        rollback_plan.sort_by_key(|action| std::cmp::Reverse(action.settlement_order));
         let reverted_actions: Vec<Value> = rollback_plan
             .into_iter()
             .map(|action| {
