@@ -15,7 +15,11 @@ An execution envelope establishes session-level authority for a non-deterministi
 - Integer, multi-dimensional aggregate budgets.
 - A short lifetime and monotonic capability generation.
 
+The envelope is a constraint contract, not a fixed execution plan. The agent may choose actions dynamically inside the admitted bounds. Implementations may construct a dependency graph incrementally from staged actions and trusted effects, but that graph does not grant authority beyond the envelope.
+
 The envelope does not define model reasoning, agent discovery, provider credentials, or universal distributed transactions.
+
+An enforcing deployment must withhold downstream credentials from the agent and route every mutating path through the boundary. It can enforce only policies and effects that are formalized and observable; it does not infer correct business intent by itself.
 
 ## 2. Security boundary
 

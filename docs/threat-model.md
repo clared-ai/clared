@@ -8,7 +8,7 @@ This document separates the envelope mechanics implemented today from the trust 
 
 ## Security objective
 
-Clared addresses operations in which an action-taking agent may choose a valid but unpredictable sequence of mutating tools. The objective is to prevent authority granted for one bounded task from becoming broader authority across tools, resources, aggregate spend, time, or capability generations, and to make the terminal outcome explicit.
+Clared addresses operations in which an action-taking agent may choose a valid but unpredictable sequence of mutating tools. The objective is to let an organization grant useful autonomy while preventing authority for one bounded task from becoming broader authority across tools, resources, aggregate spend, time, capability generations, or the cumulative trajectory, and to make the terminal outcome explicit.
 
 Clared does not attempt to prove that the agent reasoned correctly. It constrains what the resulting trajectory may do.
 
@@ -39,6 +39,8 @@ Clared does not attempt to prove that the agent reasoned correctly. It constrain
 | Failure after an early action | Adapter ordering and rollback strategy determine simulated abort behavior. | Demonstrated only in memory. No claim is made about real provider rollback. |
 | Irreversible or ambiguous provider outcome | Protocol includes degraded lifecycle states and forbids reporting `SETTLED` unless adapter settlement succeeds. | Live detection, recovery, and reconciliation are not implemented. |
 | Agent bypasses Clared | Production design requires provider credentials and mutating network paths to terminate at the enforcing proxy. | Not prevented by the Python helper alone. |
+| Policy is incomplete or depends on unobserved state | Conservative envelope bounds, explicit adapters, and commit-time revalidation limit modeled effects. | Clared cannot prevent an outcome that is neither formalized nor observable. Production policy facts must come from authenticated session history, approvals, and fresh provider state. |
+| Agent needs authority outside the active envelope | Generation-fenced amendment is the intended escalation path. | The current profile widens budgets with a fresh delegation proof; a real human approval channel, broader scope amendment, suspension, and revocation remain future work. |
 | Compromised proxy or signing key | Outside the current implementation boundary. | Requires key persistence, rotation, isolation, and operational controls. |
 | Memory exhaustion from unbounded sessions or replay records | No quotas or garbage collection in the reference server. | Known denial-of-service risk; do not expose the simulator as a public service. |
 

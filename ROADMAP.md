@@ -12,10 +12,19 @@ Clared is validating a security boundary before expanding the integration surfac
 
 ## Next: make the boundary touch real agent traffic
 
-1. Document one design partner's real multi-system workflow and failure trace.
+1. Document one consequential workflow that a design partner is unwilling to authorize today, the controls blocking it, and the evidence required to enable broader autonomy.
 2. Build an MCP-compatible enforcement shim that routes mutating tool calls through an envelope without requiring an agent rewrite.
-3. Publish conformance fixtures for capability, scope, budget, lifecycle, and idempotency behavior.
-4. Package supported Python and Rust artifacts only when their names, compatibility policy, and upgrade path are stable enough to maintain.
+3. Ensure the enforcing shim, not the agent, owns downstream credentials and mutating egress paths.
+4. Publish conformance fixtures for capability, scope, budget, lifecycle, and idempotency behavior.
+5. Package supported Python and Rust artifacts only when their names, compatibility policy, and upgrade path are stable enough to maintain.
+
+## Next: prove stateful policy and steering
+
+1. Load versioned customer Cedar bundles and evaluate them during envelope admission, tool calls, and settlement preparation.
+2. Derive authenticated policy facts from session history, approvals, adapters, and fresh provider state rather than agent-supplied context.
+3. Build an execution graph incrementally from staged actions, resource effects, dependencies, reversibility, and co-requisite obligations. The agent remains free to choose the path; it does not submit a fixed plan up front.
+4. Add explicit decision outcomes for allow-and-stage, deny-and-replan, require-approval, require-action, checkpoint, suspend, revoke, and abort.
+5. Bind the admitted envelope hash, policy version, adapter versions, and trusted state witnesses into signed evidence.
 
 ## Next: prove one real settlement mode
 
