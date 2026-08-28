@@ -29,19 +29,23 @@ pub struct JsonRpcError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SessionStatus {
-    PROPOSED,
-    ADMITTED,
-    ACTIVE,
-    SEALING,
-    SETTLED,
-    ABORTED,
-    PARTIALLY_SETTLED,
-    RECOVERY_REQUIRED,
-    RECONCILED,
+    Proposed,
+    Admitted,
+    Active,
+    Suspended,
+    Sealing,
+    Settled,
+    Aborted,
+    Expired,
+    Revoked,
+    PartiallySettled,
+    RecoveryRequired,
+    Reconciled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TypedBudgets {
     #[serde(default, rename = "money.minor.USD.hold")]
     pub money_minor_usd_hold: u64,
@@ -53,35 +57,79 @@ pub struct TypedBudgets {
     pub custom: HashMap<String, u64>,
 }
 
-impl Default for TypedBudgets {
-    fn default() -> Self {
-        Self {
-            money_minor_usd_hold: 50000,
-            money_minor_usd_capture: 50000,
-            database_mutations_count: 10,
-            custom: HashMap::new(),
+impl TypedBudgets {
+    pub fn value(&self, dimension: &str) -> Option<u64> {
+        match dimension {
+            "money.minor.USD.hold" => Some(self.money_minor_usd_hold),
+            "money.minor.USD.capture" => Some(self.money_minor_usd_capture),
+            "database.mutations.count" => Some(self.database_mutations_count),
+            custom => self.custom.get(custom).copied(),
         }
+    }
+
+    pub fn add_assign(&mut self, additions: &TypedBudgets) -> Result<(), String> {
+        self.money_minor_usd_hold = self
+            .money_minor_usd_hold
+            .checked_add(additions.money_minor_usd_hold)
+            .ok_or("Hold budget overflow")?;
+        self.money_minor_usd_capture = self
+            .money_minor_usd_capture
+            .checked_add(additions.money_minor_usd_capture)
+            .ok_or("Capture budget overflow")?;
+        self.database_mutations_count = self
+            .database_mutations_count
+            .checked_add(additions.database_mutations_count)
+            .ok_or("Database mutation budget overflow")?;
+        for (dimension, amount) in &additions.custom {
+            let current = self.custom.get(dimension).copied().unwrap_or(0);
+            self.custom.insert(
+                dimension.clone(),
+                current
+                    .checked_add(*amount)
+                    .ok_or("Custom budget overflow")?,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn deduct(&mut self, dimension: &str, amount: u64) -> Result<(), String> {
+        let slot = match dimension {
+            "money.minor.USD.hold" => &mut self.money_minor_usd_hold,
+            "money.minor.USD.capture" => &mut self.money_minor_usd_capture,
+            "database.mutations.count" => &mut self.database_mutations_count,
+            custom => self
+                .custom
+                .get_mut(custom)
+                .ok_or_else(|| format!("Budget dimension '{custom}' is not present"))?,
+        };
+        if *slot < amount {
+            return Err(format!(
+                "Budget dimension '{dimension}' has {} remaining but {amount} was requested",
+                *slot
+            ));
+        }
+        *slot -= amount;
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentProposeParams {
+    pub delegation_token: String,
     pub tenant_id: String,
     pub principal: String,
     pub agent_role: String,
     pub task_intent: String,
     #[serde(default)]
     pub target_resources: Vec<String>,
-    #[serde(default)]
     pub allowed_tools: Vec<String>,
-    #[serde(default)]
     pub budgets: TypedBudgets,
     #[serde(default = "default_ttl")]
     pub ttl_ms: u64,
 }
 
 fn default_ttl() -> u64 {
-    30000
+    30_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,41 +138,47 @@ pub struct IntentProposeResult {
     pub status: SessionStatus,
     pub capability_token: String,
     pub generation: u64,
-    pub expires_at: i64,
+    pub expires_at_ms: i64,
+    pub signer_public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentAmendParams {
+    pub session_id: String,
+    pub capability_token: String,
+    pub delegation_token: String,
+    #[serde(default)]
+    pub budget_additions: TypedBudgets,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallMeta {
     pub session_id: String,
     pub capability_token: String,
-    #[serde(default = "default_gen")]
     pub generation: u64,
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
-}
-
-fn default_gen() -> u64 {
-    1
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallParams {
     pub name: String,
     pub arguments: Value,
-    #[serde(default, rename = "_dtbe_meta")]
-    pub meta: Option<ToolCallMeta>,
+    #[serde(rename = "_clared_meta")]
+    pub meta: ToolCallMeta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentSealParams {
     pub session_id: String,
     pub capability_token: String,
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentAbortParams {
     pub session_id: String,
     pub capability_token: String,
+    pub idempotency_key: String,
     #[serde(default = "default_abort_reason")]
     pub reason: String,
 }

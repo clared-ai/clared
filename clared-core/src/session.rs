@@ -1,73 +1,129 @@
+use crate::adapter::{AdapterRegistry, ExecutionMode, RegisteredTool};
+use crate::crypto::{CapabilityClaims, CapabilitySigner};
+use crate::delegation::verify_delegation_token;
 use crate::policy::{CedarEngine, PolicyOutcome};
 use crate::protocol::{
-    IntentAbortParams, IntentProposeParams, IntentProposeResult, IntentSealParams,
-    SessionStatus, ToolCallParams, TypedBudgets,
+    IntentAbortParams, IntentAmendParams, IntentProposeParams, IntentProposeResult,
+    IntentSealParams, SessionStatus, ToolCallParams, TypedBudgets,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::collections::HashMap;
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ExecutionMode {
-    Mode1Sql,
-    Mode2Mock,
-    Mode3Reservation,
-    Mode4Checkpoint,
-    EgressSink,
-}
+type ToolError = (i32, String, Option<Value>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagedAction {
     pub tool_name: String,
     pub arguments: Value,
+    pub resource_id: String,
+    pub adapter_name: String,
     pub mode: ExecutionMode,
+    pub settlement_order: u32,
+    pub settlement_strategy: String,
+    pub rollback_strategy: String,
     pub staged_id: String,
     pub status: String,
 }
 
+struct CachedToolResult {
+    request_fingerprint: String,
+    response: Value,
+}
+
 pub struct ActiveSession {
-    pub session_id: String,
-    pub tenant_id: String,
-    pub principal: String,
-    pub agent_role: String,
-    pub task_intent: String,
-    pub target_resources: Vec<String>,
-    pub allowed_tools: Vec<String>,
-    pub initial_budget: TypedBudgets,
-    pub remaining_hold_budget_minor: u64,
-    pub remaining_capture_budget_minor: u64,
-    pub remaining_db_mutations: u64,
-    pub capability_token: String,
-    pub generation: u64,
-    pub expires_at: i64,
-    pub status: SessionStatus,
-    pub staged_actions: Vec<StagedAction>,
-    pub virtual_overlay: HashMap<String, Value>,
+    session_id: String,
+    tenant_id: String,
+    principal: String,
+    agent_role: String,
+    task_intent: String,
+    target_resources: Vec<String>,
+    allowed_tools: Vec<String>,
+    remaining_budgets: TypedBudgets,
+    capability_token: String,
+    generation: u64,
+    expires_at_ms: i64,
+    status: SessionStatus,
+    staged_actions: Vec<StagedAction>,
+    tool_results: HashMap<String, CachedToolResult>,
+    seal_idempotency_key: Option<String>,
+    settlement_result: Option<Value>,
+    abort_idempotency_key: Option<String>,
+    abort_result: Option<Value>,
 }
 
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
     policy_engine: Arc<CedarEngine>,
+    signer: Arc<CapabilitySigner>,
+    delegation_secret: Vec<u8>,
+    used_delegations: Arc<Mutex<HashSet<String>>>,
+    adapters: Arc<AdapterRegistry>,
 }
 
 impl SessionManager {
-    pub fn new(policy_engine: Arc<CedarEngine>) -> Self {
+    pub fn new(
+        policy_engine: Arc<CedarEngine>,
+        signer: Arc<CapabilitySigner>,
+        delegation_secret: Vec<u8>,
+        adapters: Arc<AdapterRegistry>,
+    ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             policy_engine,
+            signer,
+            delegation_secret,
+            used_delegations: Arc::new(Mutex::new(HashSet::new())),
+            adapters,
         }
     }
 
-    /// Proposes a new execution envelope and issues an initial capability token.
     pub fn propose(&self, params: IntentProposeParams) -> Result<IntentProposeResult, String> {
-        let session_id = format!("ses_{}", Uuid::new_v4().simple());
-        let capability_token = format!("cap_tok_{}", Uuid::new_v4().simple());
-        let expires_at = chrono::Utc::now().timestamp_millis() + (params.ttl_ms as i64);
+        if !(1_000..=600_000).contains(&params.ttl_ms) {
+            return Err("ttl_ms must be between 1000 and 600000".to_string());
+        }
+        if params.allowed_tools.is_empty() {
+            return Err("allowed_tools must contain at least one adapted tool".to_string());
+        }
+        for tool in &params.allowed_tools {
+            let adapter = self.adapters.get(tool).ok_or_else(|| {
+                format!("Tool '{tool}' has no registered Clared Settlement Adapter")
+            })?;
+            if !adapter.resource_arguments.is_empty() && params.target_resources.is_empty() {
+                return Err(format!(
+                    "Tool '{tool}' requires at least one target_resources scope"
+                ));
+            }
+        }
 
-        let active_sess = ActiveSession {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        verify_delegation_token(
+            &self.delegation_secret,
+            &params.delegation_token,
+            &params.tenant_id,
+            &params.principal,
+            &params.agent_role,
+            &params.task_intent,
+            now_ms,
+        )?;
+
+        let session_id = format!("ses_{}", Uuid::new_v4().simple());
+        let expires_at_ms = now_ms + params.ttl_ms as i64;
+        let claims = CapabilityClaims {
+            session_id: session_id.clone(),
+            tenant_id: params.tenant_id.clone(),
+            principal: params.principal.clone(),
+            generation: 1,
+            issued_at_ms: now_ms,
+            expires_at_ms,
+            jti: format!("jti_{}", Uuid::new_v4().simple()),
+        };
+        let capability_token = self.signer.issue(&claims)?;
+
+        let session = ActiveSession {
             session_id: session_id.clone(),
             tenant_id: params.tenant_id,
             principal: params.principal,
@@ -75,361 +131,839 @@ impl SessionManager {
             task_intent: params.task_intent,
             target_resources: params.target_resources,
             allowed_tools: params.allowed_tools,
-            remaining_hold_budget_minor: params.budgets.money_minor_usd_hold,
-            remaining_capture_budget_minor: params.budgets.money_minor_usd_capture,
-            remaining_db_mutations: params.budgets.database_mutations_count,
-            initial_budget: params.budgets,
+            remaining_budgets: params.budgets,
             capability_token: capability_token.clone(),
             generation: 1,
-            expires_at,
-            status: SessionStatus::ADMITTED,
+            expires_at_ms,
+            status: SessionStatus::Admitted,
             staged_actions: Vec::new(),
-            virtual_overlay: HashMap::new(),
+            tool_results: HashMap::new(),
+            seal_idempotency_key: None,
+            settlement_result: None,
+            abort_idempotency_key: None,
+            abort_result: None,
         };
-
-        self.sessions.write().insert(session_id.clone(), active_sess);
+        self.consume_delegation(&params.delegation_token)?;
+        self.sessions.write().insert(session_id.clone(), session);
 
         Ok(IntentProposeResult {
             session_id,
-            status: SessionStatus::ADMITTED,
+            status: SessionStatus::Admitted,
             capability_token,
             generation: 1,
-            expires_at,
+            expires_at_ms,
+            signer_public_key: self.signer.public_key_base64(),
         })
     }
 
-    /// Intercepts a tool call, evaluates invariants, deducts typed budgets, and stages execution.
-    pub fn execute_tool(&self, params: ToolCallParams) -> Result<Value, (i32, String, Option<Value>)> {
-        let meta = params.meta.as_ref().ok_or_else(|| {
-            (-32003, "Missing capability metadata _dtbe_meta in tool call".to_string(), None)
-        })?;
-
+    pub fn amend(&self, params: IntentAmendParams) -> Result<Value, String> {
+        let claims = self.signer.verify(&params.capability_token)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let mut sessions = self.sessions.write();
-        let session = sessions.get_mut(&meta.session_id).ok_or_else(|| {
-            (-32005, format!("Session '{}' not found or expired", meta.session_id), None)
+        let session = sessions
+            .get_mut(&params.session_id)
+            .ok_or_else(|| format!("Session '{}' not found", params.session_id))?;
+
+        Self::validate_capability(session, &claims, &params.capability_token, now_ms)?;
+        if !matches!(
+            session.status,
+            SessionStatus::Admitted | SessionStatus::Active
+        ) {
+            return Err(format!(
+                "Session cannot be amended from state {:?}",
+                session.status
+            ));
+        }
+        verify_delegation_token(
+            &self.delegation_secret,
+            &params.delegation_token,
+            &session.tenant_id,
+            &session.principal,
+            &session.agent_role,
+            &session.task_intent,
+            now_ms,
+        )?;
+
+        let mut next_budgets = session.remaining_budgets.clone();
+        next_budgets.add_assign(&params.budget_additions)?;
+        let next_generation = session
+            .generation
+            .checked_add(1)
+            .ok_or("Session generation overflow")?;
+        let new_claims = CapabilityClaims {
+            session_id: session.session_id.clone(),
+            tenant_id: session.tenant_id.clone(),
+            principal: session.principal.clone(),
+            generation: next_generation,
+            issued_at_ms: now_ms,
+            expires_at_ms: session.expires_at_ms,
+            jti: format!("jti_{}", Uuid::new_v4().simple()),
+        };
+        let next_capability_token = self.signer.issue(&new_claims)?;
+
+        self.consume_delegation(&params.delegation_token)?;
+        session.status = SessionStatus::Suspended;
+        session.remaining_budgets = next_budgets;
+        session.generation = next_generation;
+        session.capability_token = next_capability_token;
+        session.status = SessionStatus::Active;
+
+        Ok(json!({
+            "session_id": session.session_id,
+            "status": session.status,
+            "capability_token": session.capability_token,
+            "generation": session.generation,
+            "expires_at_ms": session.expires_at_ms,
+            "remaining_budgets": session.remaining_budgets,
+        }))
+    }
+
+    pub fn execute_tool(&self, params: ToolCallParams) -> Result<Value, ToolError> {
+        if params.meta.idempotency_key.trim().is_empty() {
+            return Err((-32602, "idempotency_key is required".to_string(), None));
+        }
+        let claims = self
+            .signer
+            .verify(&params.meta.capability_token)
+            .map_err(|message| (-32004, message, None))?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let adapter = self.adapters.get(&params.name).cloned().ok_or_else(|| {
+            (
+                -32007,
+                format!(
+                    "Tool '{}' has no registered Settlement Adapter",
+                    params.name
+                ),
+                None,
+            )
         })?;
 
-        // 1. Generation Fencing Check
-        if meta.generation != session.generation {
+        let fingerprint = serde_json::to_string(&(params.name.as_str(), &params.arguments))
+            .map_err(|error| (-32602, format!("Tool arguments are invalid: {error}"), None))?;
+        let mut sessions = self.sessions.write();
+        let session = sessions.get_mut(&params.meta.session_id).ok_or_else(|| {
+            (
+                -32005,
+                format!("Session '{}' not found", params.meta.session_id),
+                None,
+            )
+        })?;
+
+        if let Err(message) =
+            Self::validate_capability(session, &claims, &params.meta.capability_token, now_ms)
+        {
+            if now_ms >= session.expires_at_ms {
+                session.status = SessionStatus::Expired;
+            }
+            return Err((-32004, message, None));
+        }
+        if params.meta.generation != session.generation {
             return Err((
                 -32004,
                 format!(
-                    "Stale capability generation (presented: {}, active: {})",
-                    meta.generation, session.generation
+                    "Stale capability generation: presented {}, active {}",
+                    params.meta.generation, session.generation
                 ),
                 None,
             ));
         }
-
-        // 2. Allowed Tools Whitelist Check
-        if !session.allowed_tools.is_empty() && !session.allowed_tools.contains(&params.name) {
+        if !matches!(
+            session.status,
+            SessionStatus::Admitted | SessionStatus::Active
+        ) {
+            return Err((
+                -32008,
+                format!("Tool calls are not permitted in state {:?}", session.status),
+                None,
+            ));
+        }
+        if !session.allowed_tools.contains(&params.name) {
             return Err((
                 -32003,
-                format!("Tool '{}' is not permitted in active envelope whitelist", params.name),
+                format!("Tool '{}' is outside the execution envelope", params.name),
                 None,
             ));
         }
 
-        // 3. Cedar Policy Evaluation
-        let resource_target = session
-            .target_resources
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "default_resource".to_string());
+        if let Some(cached) = session.tool_results.get(&params.meta.idempotency_key) {
+            if cached.request_fingerprint != fingerprint {
+                return Err((
+                    -32009,
+                    "Idempotency key was already used for a different tool request".to_string(),
+                    None,
+                ));
+            }
+            return Ok(cached.response.clone());
+        }
 
+        let resource_id =
+            Self::validate_resource_scope(&adapter, &params.arguments, &session.target_resources)?;
+        let policy_context = Self::policy_context(&params.arguments);
         match self.policy_engine.evaluate(
             &session.principal,
             &params.name,
-            &resource_target,
-            &params.arguments,
+            &resource_id,
+            &policy_context,
         ) {
             PolicyOutcome::Allow => {}
-            PolicyOutcome::Deny { reason, violating_policies } => {
+            PolicyOutcome::Deny {
+                reason,
+                violating_policies,
+            } => {
                 return Err((
                     -32006,
-                    format!("INVARIANT_VIOLATION: {}", reason),
+                    format!("INVARIANT_VIOLATION: {reason}"),
                     Some(json!({ "violating_policies": violating_policies })),
                 ));
             }
         }
 
-        // 4. Minor-Unit Budget Deductions
-        let is_financial = params.name.contains("stripe") || params.name.contains("refund") || params.name.contains("payment");
-        if is_financial {
-            let requested_amount = params
-                .arguments
-                .get("amount_minor")
-                .and_then(|v| v.as_u64())
-                .or_else(|| {
-                    // Fallback from float amount if passed
-                    params.arguments.get("amount").and_then(|v| v.as_f64()).map(|amt| (amt * 100.0) as u64)
-                })
-                .unwrap_or(0);
-
-            if requested_amount > session.remaining_capture_budget_minor {
+        let charges = Self::calculate_budget_charges(&adapter, &params.arguments)?;
+        for (dimension, amount) in &charges {
+            let remaining = session.remaining_budgets.value(dimension).unwrap_or(0);
+            if remaining < *amount {
                 return Err((
                     -32001,
                     format!(
-                        "INSUFFICIENT_BUDGET: Requested {} minor units, but only {} remaining in envelope",
-                        requested_amount, session.remaining_capture_budget_minor
+                        "INSUFFICIENT_BUDGET: '{dimension}' requested {amount}, remaining {remaining}"
                     ),
                     Some(json!({
-                        "requested_minor": requested_amount,
-                        "remaining_minor": session.remaining_capture_budget_minor,
-                        "remediation_hint": "Reduce amount or call intent/amend to request budget expansion"
+                        "dimension": dimension,
+                        "requested": amount,
+                        "remaining": remaining,
+                        "remediation_hint": "Reduce the operation or use intent/amend with a fresh delegation token"
                     })),
                 ));
             }
-
-            session.remaining_capture_budget_minor -= requested_amount;
+        }
+        for (dimension, amount) in charges {
+            session
+                .remaining_budgets
+                .deduct(&dimension, amount)
+                .map_err(|message| (-32001, message, None))?;
         }
 
-        // 5. Execution Staging
-        session.status = SessionStatus::ACTIVE;
+        session.status = SessionStatus::Active;
         let staged_id = format!("stg_{}", Uuid::new_v4().simple());
+        let response = Self::simulated_stage_response(&adapter, &staged_id);
+        session.staged_actions.push(StagedAction {
+            tool_name: params.name,
+            arguments: params.arguments,
+            resource_id,
+            adapter_name: adapter.adapter_name,
+            mode: adapter.mode,
+            settlement_order: adapter.settlement_order,
+            settlement_strategy: adapter.settlement_strategy,
+            rollback_strategy: adapter.rollback_strategy,
+            staged_id,
+            status: "SIMULATED_STAGED".to_string(),
+        });
+        session.tool_results.insert(
+            params.meta.idempotency_key,
+            CachedToolResult {
+                request_fingerprint: fingerprint,
+                response: response.clone(),
+            },
+        );
 
-        if params.name.contains("postgres") || params.name.contains("db") || params.name.contains("sql") {
-            session.staged_actions.push(StagedAction {
-                tool_name: params.name.clone(),
-                arguments: params.arguments.clone(),
-                mode: ExecutionMode::Mode1Sql,
-                staged_id: staged_id.clone(),
-                status: "STAGED_IN_PINNED_TX".to_string(),
-            });
-            Ok(json!({
-                "status": "STAGED_SAVEPOINT",
-                "rows_affected": 1,
-                "message": "Mutation staged inside connection-pinned transaction block."
-            }))
-        } else if is_financial {
-            session.staged_actions.push(StagedAction {
-                tool_name: params.name.clone(),
-                arguments: params.arguments.clone(),
-                mode: ExecutionMode::Mode3Reservation,
-                staged_id: staged_id.clone(),
-                status: "AUTH_HOLD_RESERVED".to_string(),
-            });
-            Ok(json!({
-                "id": format!("re_hold_{}", Uuid::new_v4().simple()),
-                "status": "requires_capture",
-                "capture_method": "manual",
-                "message": "Two-phase authorization hold placed. Zero funds settled until seal."
-            }))
-        } else if params.name.contains("twilio") || params.name.contains("sms") || params.name.contains("email") {
-            session.staged_actions.push(StagedAction {
-                tool_name: params.name.clone(),
-                arguments: params.arguments.clone(),
-                mode: ExecutionMode::EgressSink,
-                staged_id: staged_id.clone(),
-                status: "BUFFERED_IN_RAM".to_string(),
-            });
-            Ok(json!({
-                "status": "BUFFERED_IN_RAM",
-                "message": "Egress notification buffered in RAM. Will flush upon successful seal."
-            }))
-        } else {
-            session.staged_actions.push(StagedAction {
-                tool_name: params.name.clone(),
-                arguments: params.arguments.clone(),
-                mode: ExecutionMode::Mode2Mock,
-                staged_id: staged_id.clone(),
-                status: "STAGED".to_string(),
-            });
-            Ok(json!({
-                "id": format!("virt_{}", Uuid::new_v4().simple()),
-                "status": "STAGED_SUCCESS"
-            }))
-        }
+        Ok(response)
     }
 
-    /// Seals the session and coordinates atomic settlement across staged actions.
     pub fn seal(&self, params: IntentSealParams) -> Result<Value, String> {
+        if params.idempotency_key.trim().is_empty() {
+            return Err("idempotency_key is required".to_string());
+        }
+        let claims = self.signer.verify(&params.capability_token)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let mut sessions = self.sessions.write();
-        let session = sessions.get_mut(&params.session_id).ok_or_else(|| {
-            format!("Session '{}' not found", params.session_id)
-        })?;
+        let session = sessions
+            .get_mut(&params.session_id)
+            .ok_or_else(|| format!("Session '{}' not found", params.session_id))?;
+        Self::validate_capability(session, &claims, &params.capability_token, now_ms)?;
 
-        session.status = SessionStatus::SEALING;
-
-        let mut settled_actions = Vec::new();
-
-        // 1. Flush Mode 3 Upstream Holds (Stripe)
-        for act in session.staged_actions.iter().filter(|a| matches!(a.mode, ExecutionMode::Mode3Reservation)) {
-            settled_actions.push(json!({
-                "tool": act.tool_name,
-                "staged_id": act.staged_id,
-                "status": "CAPTURED",
-                "settlement_type": "ATOMIC_HOLD_CAPTURE"
-            }));
+        if session.status == SessionStatus::Settled {
+            if session.seal_idempotency_key.as_deref() == Some(&params.idempotency_key) {
+                return session
+                    .settlement_result
+                    .clone()
+                    .ok_or_else(|| "Settled session is missing its receipt".to_string());
+            }
+            return Err("Session is already settled under a different idempotency key".to_string());
+        }
+        if !matches!(
+            session.status,
+            SessionStatus::Admitted | SessionStatus::Active
+        ) {
+            return Err(format!(
+                "Session cannot be sealed from state {:?}",
+                session.status
+            ));
         }
 
-        // 2. Commit Mode 1 Database Transactions
-        for act in session.staged_actions.iter().filter(|a| matches!(a.mode, ExecutionMode::Mode1Sql)) {
-            settled_actions.push(json!({
-                "tool": act.tool_name,
-                "staged_id": act.staged_id,
-                "status": "COMMITTED",
-                "settlement_type": "SQL_TX_COMMIT"
-            }));
+        session.status = SessionStatus::Sealing;
+        for action in &session.staged_actions {
+            let policy_context = Self::policy_context(&action.arguments);
+            if let PolicyOutcome::Deny { reason, .. } = self.policy_engine.evaluate(
+                &session.principal,
+                &action.tool_name,
+                &action.resource_id,
+                &policy_context,
+            ) {
+                session.status = SessionStatus::Aborted;
+                session.staged_actions.clear();
+                return Err(format!(
+                    "Commit-time invariant revalidation failed: {reason}"
+                ));
+            }
         }
 
-        // 3. Flush Egress Notification Sinks
-        for act in session.staged_actions.iter().filter(|a| matches!(a.mode, ExecutionMode::EgressSink)) {
-            settled_actions.push(json!({
-                "tool": act.tool_name,
-                "staged_id": act.staged_id,
-                "status": "DISPATCHED",
-                "settlement_type": "EGRESS_SINK_FLUSH"
-            }));
-        }
-
-        session.status = SessionStatus::SETTLED;
-
-        Ok(json!({
+        let mut settlement_plan: Vec<&StagedAction> = session.staged_actions.iter().collect();
+        settlement_plan.sort_by_key(|action| action.settlement_order);
+        let settled_actions: Vec<Value> = settlement_plan
+            .into_iter()
+            .map(|action| {
+                let status = match action.mode {
+                    ExecutionMode::Mode1Sql => "SIMULATED_COMMITTED",
+                    ExecutionMode::Mode3Reservation => "SIMULATED_CAPTURED",
+                    ExecutionMode::EgressSink => "SIMULATED_DISPATCHED",
+                    ExecutionMode::Mode2Mock => "SIMULATED_MATERIALIZED",
+                    ExecutionMode::Mode4Checkpoint => "SIMULATED_CHECKPOINTED",
+                };
+                json!({
+                    "tool": action.tool_name,
+                    "adapter": action.adapter_name,
+                    "staged_id": action.staged_id,
+                    "status": status,
+                    "mode": action.mode,
+                    "settlement_order": action.settlement_order,
+                    "settlement_strategy": action.settlement_strategy,
+                })
+            })
+            .collect();
+        let evidence = json!({
+            "session_id": session.session_id,
+            "tenant_id": session.tenant_id,
+            "principal": session.principal,
+            "generation": session.generation,
+            "execution_backend": "in_memory_simulator",
+            "settled_actions": settled_actions,
+        });
+        let (evidence_hash, evidence_signature) = self.signer.sign_evidence(&evidence)?;
+        let result = json!({
             "session_id": session.session_id,
             "status": "SETTLED",
-            "evidence_hash": format!("sha256:{}", Uuid::new_v4().simple()),
-            "settled_actions": settled_actions
-        }))
+            "execution_backend": "in_memory_simulator",
+            "evidence": evidence,
+            "evidence_hash": evidence_hash,
+            "evidence_signature": evidence_signature,
+            "signer_public_key": self.signer.public_key_base64(),
+            "settled_actions": settled_actions,
+        });
+
+        session.status = SessionStatus::Settled;
+        session.seal_idempotency_key = Some(params.idempotency_key);
+        session.settlement_result = Some(result.clone());
+        Ok(result)
     }
 
-    /// Aborts the session and rolls back all staged holds and transactions with zero side effects.
     pub fn abort(&self, params: IntentAbortParams) -> Result<Value, String> {
+        if params.idempotency_key.trim().is_empty() {
+            return Err("idempotency_key is required".to_string());
+        }
+        let claims = self.signer.verify(&params.capability_token)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let mut sessions = self.sessions.write();
-        let session = sessions.get_mut(&params.session_id).ok_or_else(|| {
-            format!("Session '{}' not found", params.session_id)
-        })?;
+        let session = sessions
+            .get_mut(&params.session_id)
+            .ok_or_else(|| format!("Session '{}' not found", params.session_id))?;
+        Self::validate_capability(session, &claims, &params.capability_token, now_ms)?;
 
-        session.status = SessionStatus::ABORTED;
-        let count = session.staged_actions.len();
+        if session.status == SessionStatus::Aborted {
+            if session.abort_idempotency_key.as_deref() == Some(&params.idempotency_key) {
+                return session
+                    .abort_result
+                    .clone()
+                    .ok_or_else(|| "Aborted session is missing its receipt".to_string());
+            }
+            return Err("Session is already aborted under a different idempotency key".to_string());
+        }
+        if !matches!(
+            session.status,
+            SessionStatus::Admitted
+                | SessionStatus::Active
+                | SessionStatus::Suspended
+                | SessionStatus::Sealing
+        ) {
+            return Err(format!(
+                "Session cannot be aborted from state {:?}",
+                session.status
+            ));
+        }
+
+        let mut rollback_plan: Vec<&StagedAction> = session.staged_actions.iter().collect();
+        rollback_plan.sort_by(|left, right| right.settlement_order.cmp(&left.settlement_order));
+        let reverted_actions: Vec<Value> = rollback_plan
+            .into_iter()
+            .map(|action| {
+                json!({
+                    "tool": action.tool_name,
+                    "adapter": action.adapter_name,
+                    "staged_id": action.staged_id,
+                    "status": "SIMULATED_REVERTED",
+                    "rollback_strategy": action.rollback_strategy,
+                })
+            })
+            .collect();
+        let reverted_actions_count = reverted_actions.len();
         session.staged_actions.clear();
-
-        Ok(json!({
+        session.status = SessionStatus::Aborted;
+        let result = json!({
             "session_id": session.session_id,
             "status": "ABORTED",
+            "execution_backend": "in_memory_simulator",
             "reason": params.reason,
-            "reverted_actions_count": count,
-            "message": "All staged holds cancelled, SQL transactions rolled back, and RAM buffers cleared."
-        }))
+            "reverted_actions": reverted_actions,
+            "reverted_actions_count": reverted_actions_count,
+            "escaped_side_effects": 0,
+        });
+        session.abort_idempotency_key = Some(params.idempotency_key);
+        session.abort_result = Some(result.clone());
+        Ok(result)
+    }
+
+    fn validate_capability(
+        session: &ActiveSession,
+        claims: &CapabilityClaims,
+        presented_token: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        if presented_token != session.capability_token {
+            return Err("Capability token is not active for this session".to_string());
+        }
+        if claims.session_id != session.session_id
+            || claims.tenant_id != session.tenant_id
+            || claims.principal != session.principal
+            || claims.generation != session.generation
+        {
+            return Err("Capability claims do not match the active session".to_string());
+        }
+        if claims.expires_at_ms != session.expires_at_ms || now_ms >= session.expires_at_ms {
+            return Err("Capability and session have expired".to_string());
+        }
+        Ok(())
+    }
+
+    fn consume_delegation(&self, token: &str) -> Result<(), String> {
+        if !self.used_delegations.lock().insert(token.to_string()) {
+            return Err("Delegation token has already been consumed".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_resource_scope(
+        adapter: &RegisteredTool,
+        arguments: &Value,
+        target_resources: &[String],
+    ) -> Result<String, ToolError> {
+        if adapter.resource_arguments.is_empty() {
+            return Ok(target_resources
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unscoped".to_string()));
+        }
+
+        let mut first_match = None;
+        for resource_argument in &adapter.resource_arguments {
+            let resource_value = arguments
+                .get(&resource_argument.argument)
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    (
+                        -32002,
+                        format!(
+                            "Required resource argument '{}' is missing",
+                            resource_argument.argument
+                        ),
+                        None,
+                    )
+                })?;
+            let qualified_resource =
+                format!("{}:{}", resource_argument.scope_prefix, resource_value);
+            let matching_scope = target_resources.iter().find(|scope| {
+                scope.as_str() == resource_value || scope.as_str() == qualified_resource
+            });
+            let matching_scope = matching_scope.ok_or_else(|| {
+                (
+                    -32002,
+                    format!(
+                        "Resource '{qualified_resource}' from '{}' is outside the execution envelope",
+                        resource_argument.argument
+                    ),
+                    Some(json!({ "allowed_resources": target_resources })),
+                )
+            })?;
+            if first_match.is_none() {
+                first_match = Some(matching_scope.clone());
+            }
+        }
+
+        Ok(first_match.unwrap_or_else(|| "unscoped".to_string()))
+    }
+
+    fn calculate_budget_charges(
+        adapter: &RegisteredTool,
+        arguments: &Value,
+    ) -> Result<Vec<(String, u64)>, ToolError> {
+        let mut charges = Vec::new();
+        for charge in &adapter.budget_charges {
+            let amount = if let Some(argument_name) = &charge.argument {
+                arguments
+                    .get(argument_name)
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        (
+                            -32602,
+                            format!(
+                                "Budgeted argument '{argument_name}' must be a non-negative integer minor-unit value"
+                            ),
+                            None,
+                        )
+                    })?
+            } else {
+                charge.constant.ok_or_else(|| {
+                    (
+                        -32603,
+                        format!(
+                            "Adapter budget charge '{}' has neither argument nor constant",
+                            charge.dimension
+                        ),
+                        None,
+                    )
+                })?
+            };
+            charges.push((charge.dimension.clone(), amount));
+        }
+        Ok(charges)
+    }
+
+    fn policy_context(arguments: &Value) -> Value {
+        let mut context = arguments.as_object().cloned().unwrap_or_else(Map::new);
+        context
+            .entry("has_director_approval".to_string())
+            .or_insert(Value::Bool(false));
+        Value::Object(context)
+    }
+
+    fn simulated_stage_response(adapter: &RegisteredTool, staged_id: &str) -> Value {
+        let (status, message) = match adapter.mode {
+            ExecutionMode::Mode1Sql => (
+                "SIMULATED_STAGED_TX",
+                "Database mutation recorded by the in-memory transaction simulator.",
+            ),
+            ExecutionMode::Mode3Reservation => (
+                "SIMULATED_AUTH_HOLD",
+                "Provider authorization hold recorded by the in-memory adapter simulator.",
+            ),
+            ExecutionMode::EgressSink => (
+                "SIMULATED_BUFFERED_EGRESS",
+                "Notification recorded by the in-memory egress simulator.",
+            ),
+            ExecutionMode::Mode2Mock => (
+                "SIMULATED_STAGED_OBJECT",
+                "Object recorded by the in-memory overlay simulator.",
+            ),
+            ExecutionMode::Mode4Checkpoint => (
+                "SIMULATED_CHECKPOINT",
+                "Checkpoint recorded by the in-memory simulator.",
+            ),
+        };
+        json!({
+            "staged_id": staged_id,
+            "status": status,
+            "execution_backend": "in_memory_simulator",
+            "staging_strategy": adapter.staging_strategy,
+            "message": message,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::CapabilitySigner;
+    use crate::delegation::issue_delegation_token;
+    use crate::protocol::ToolCallMeta;
     use serde_json::json;
 
-    #[test]
-    fn test_full_session_lifecycle() {
-        let engine = Arc::new(CedarEngine::new().unwrap());
-        let mgr = SessionManager::new(engine);
+    const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 
-        // 1. Propose Envelope with $500 budget
-        let prop_res = mgr.propose(IntentProposeParams {
-            tenant_id: "acme".to_string(),
-            principal: "alice".to_string(),
-            agent_role: "support".to_string(),
-            task_intent: "resolve_dispute".to_string(),
-            target_resources: vec!["customer:cus_9918".to_string()],
-            allowed_tools: vec![
-                "stripe.payment_intents.refund".to_string(),
-                "postgres.orders.update".to_string(),
-                "twilio.sms.send".to_string(),
-            ],
-            budgets: TypedBudgets {
-                money_minor_usd_hold: 50000,
-                money_minor_usd_capture: 50000,
-                database_mutations_count: 5,
-                custom: HashMap::new(),
-            },
-            ttl_ms: 30000,
-        }).unwrap();
+    fn manager() -> (SessionManager, Arc<CapabilitySigner>) {
+        let signer = Arc::new(CapabilitySigner::from_seed([5_u8; 32]));
+        (
+            SessionManager::new(
+                Arc::new(CedarEngine::new().unwrap()),
+                signer.clone(),
+                SECRET.to_vec(),
+                Arc::new(AdapterRegistry::built_in().unwrap()),
+            ),
+            signer,
+        )
+    }
 
-        assert_eq!(prop_res.status, SessionStatus::ADMITTED);
+    fn propose(manager: &SessionManager, db_budget: u64) -> IntentProposeResult {
+        let now = chrono::Utc::now().timestamp_millis();
+        let token = issue_delegation_token(
+            SECRET,
+            "acme",
+            "alice",
+            "checkout",
+            "authorize_order",
+            now + 60_000,
+        )
+        .unwrap();
+        manager
+            .propose(IntentProposeParams {
+                delegation_token: token,
+                tenant_id: "acme".to_string(),
+                principal: "alice".to_string(),
+                agent_role: "checkout".to_string(),
+                task_intent: "authorize_order".to_string(),
+                target_resources: vec![
+                    "customer:cus_9918".to_string(),
+                    "order:ord_1042".to_string(),
+                ],
+                allowed_tools: vec![
+                    "stripe.payment_intents.create".to_string(),
+                    "postgres.orders.update".to_string(),
+                    "twilio.messages.create".to_string(),
+                ],
+                budgets: TypedBudgets {
+                    money_minor_usd_hold: 50_000,
+                    money_minor_usd_capture: 50_000,
+                    database_mutations_count: db_budget,
+                    custom: HashMap::from([("external_notifications.count".to_string(), 1)]),
+                },
+                ttl_ms: 30_000,
+            })
+            .unwrap()
+    }
 
-        // 2. Call Tool 1: DB update (Mode 1)
-        let db_res = mgr.execute_tool(ToolCallParams {
-            name: "postgres.orders.update".to_string(),
-            arguments: json!({ "status": "refund_approved" }),
-            meta: Some(crate::protocol::ToolCallMeta {
-                session_id: prop_res.session_id.clone(),
-                capability_token: prop_res.capability_token.clone(),
-                generation: 1,
-                idempotency_key: None,
-            }),
-        }).unwrap();
-        assert_eq!(db_res.get("status").unwrap(), "STAGED_SAVEPOINT");
-
-        // 3. Call Tool 2: Stripe refund of $450 (Mode 3)
-        let stripe_res = mgr.execute_tool(ToolCallParams {
-            name: "stripe.payment_intents.refund".to_string(),
-            arguments: json!({ "amount_minor": 45000 }),
-            meta: Some(crate::protocol::ToolCallMeta {
-                session_id: prop_res.session_id.clone(),
-                capability_token: prop_res.capability_token.clone(),
-                generation: 1,
-                idempotency_key: None,
-            }),
-        }).unwrap();
-        assert_eq!(stripe_res.get("status").unwrap(), "requires_capture");
-
-        // 4. Call Tool 3: Try to exceed remaining budget ($100 when only $50 remains)
-        let overbudget_res = mgr.execute_tool(ToolCallParams {
-            name: "stripe.payment_intents.refund".to_string(),
-            arguments: json!({ "amount_minor": 10000 }),
-            meta: Some(crate::protocol::ToolCallMeta {
-                session_id: prop_res.session_id.clone(),
-                capability_token: prop_res.capability_token.clone(),
-                generation: 1,
-                idempotency_key: None,
-            }),
-        });
-        assert!(overbudget_res.is_err());
-        let (err_code, _, _) = overbudget_res.err().unwrap();
-        assert_eq!(err_code, -32001); // INSUFFICIENT_BUDGET
-
-        // 5. Seal Session
-        let seal_res = mgr.seal(IntentSealParams {
-            session_id: prop_res.session_id.clone(),
-            capability_token: prop_res.capability_token.clone(),
-        }).unwrap();
-        assert_eq!(seal_res.get("status").unwrap(), "SETTLED");
+    fn call_meta(result: &IntentProposeResult, key: &str) -> ToolCallMeta {
+        ToolCallMeta {
+            session_id: result.session_id.clone(),
+            capability_token: result.capability_token.clone(),
+            generation: result.generation,
+            idempotency_key: key.to_string(),
+        }
     }
 
     #[test]
-    fn test_abort_clears_staged_actions() {
-        let engine = Arc::new(CedarEngine::new().unwrap());
-        let mgr = SessionManager::new(engine);
+    fn forged_expired_and_out_of_scope_calls_are_rejected() {
+        let (manager, _) = manager();
+        let result = propose(&manager, 1);
 
-        let prop_res = mgr.propose(IntentProposeParams {
+        let mut forged = call_meta(&result, "call-forged");
+        forged.capability_token = "forged".to_string();
+        assert!(manager
+            .execute_tool(ToolCallParams {
+                name: "stripe.payment_intents.create".to_string(),
+                arguments: json!({"amount_minor": 1000, "customer_id": "cus_9918"}),
+                meta: forged,
+            })
+            .is_err());
+
+        assert!(manager
+            .execute_tool(ToolCallParams {
+                name: "stripe.payment_intents.create".to_string(),
+                arguments: json!({"amount_minor": 1000, "customer_id": "cus_outside"}),
+                meta: call_meta(&result, "call-scope"),
+            })
+            .is_err());
+
+        assert!(manager
+            .execute_tool(ToolCallParams {
+                name: "stripe.payment_intents.create".to_string(),
+                arguments: json!({"amount_minor": 1000, "customer_id": "ord_1042"}),
+                meta: call_meta(&result, "call-wrong-resource-type"),
+            })
+            .is_err());
+
+        manager
+            .sessions
+            .write()
+            .get_mut(&result.session_id)
+            .unwrap()
+            .expires_at_ms = chrono::Utc::now().timestamp_millis() - 1;
+        assert!(manager
+            .execute_tool(ToolCallParams {
+                name: "stripe.payment_intents.create".to_string(),
+                arguments: json!({"amount_minor": 1000, "customer_id": "cus_9918"}),
+                meta: call_meta(&result, "call-expired"),
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn budgets_and_tool_idempotency_are_enforced() {
+        let (manager, _) = manager();
+        let result = propose(&manager, 1);
+        let params = ToolCallParams {
+            name: "postgres.orders.update".to_string(),
+            arguments: json!({"order_id": "ord_1042", "status": "authorized"}),
+            meta: call_meta(&result, "db-call-1"),
+        };
+        let first = manager.execute_tool(params).unwrap();
+        let replay = manager
+            .execute_tool(ToolCallParams {
+                name: "postgres.orders.update".to_string(),
+                arguments: json!({"order_id": "ord_1042", "status": "authorized"}),
+                meta: call_meta(&result, "db-call-1"),
+            })
+            .unwrap();
+        assert_eq!(first, replay);
+        assert!(manager
+            .execute_tool(ToolCallParams {
+                name: "postgres.orders.update".to_string(),
+                arguments: json!({"order_id": "ord_1042", "status": "second"}),
+                meta: call_meta(&result, "db-call-2"),
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn settlement_is_signed_idempotent_and_terminal() {
+        let (manager, signer) = manager();
+        let result = propose(&manager, 1);
+        manager
+            .execute_tool(ToolCallParams {
+                name: "twilio.messages.create".to_string(),
+                arguments: json!({"to": "+15550192834", "body": "done"}),
+                meta: call_meta(&result, "twilio-call-1"),
+            })
+            .unwrap();
+        manager
+            .execute_tool(ToolCallParams {
+                name: "stripe.payment_intents.create".to_string(),
+                arguments: json!({"amount_minor": 45000, "customer_id": "cus_9918"}),
+                meta: call_meta(&result, "stripe-call-1"),
+            })
+            .unwrap();
+        manager
+            .execute_tool(ToolCallParams {
+                name: "postgres.orders.update".to_string(),
+                arguments: json!({"order_id": "ord_1042", "status": "authorized"}),
+                meta: call_meta(&result, "postgres-call-1"),
+            })
+            .unwrap();
+        let seal_params = IntentSealParams {
+            session_id: result.session_id.clone(),
+            capability_token: result.capability_token.clone(),
+            idempotency_key: "seal-1".to_string(),
+        };
+        let receipt = manager.seal(seal_params.clone()).unwrap();
+        assert_eq!(receipt, manager.seal(seal_params).unwrap());
+        CapabilitySigner::verify_evidence(
+            receipt["signer_public_key"].as_str().unwrap(),
+            &receipt["evidence"],
+            receipt["evidence_signature"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["signer_public_key"], signer.public_key_base64());
+        assert_eq!(
+            receipt["settled_actions"][0]["tool"],
+            "postgres.orders.update"
+        );
+        assert_eq!(
+            receipt["settled_actions"][1]["tool"],
+            "stripe.payment_intents.create"
+        );
+        assert_eq!(
+            receipt["settled_actions"][2]["tool"],
+            "twilio.messages.create"
+        );
+
+        assert!(manager
+            .execute_tool(ToolCallParams {
+                name: "stripe.payment_intents.create".to_string(),
+                arguments: json!({"amount_minor": 1000, "customer_id": "cus_9918"}),
+                meta: call_meta(&result, "after-settle"),
+            })
+            .is_err());
+        assert!(manager
+            .abort(IntentAbortParams {
+                session_id: result.session_id,
+                capability_token: result.capability_token,
+                idempotency_key: "abort-after-settle".to_string(),
+                reason: "must fail".to_string(),
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn amendment_fences_the_previous_capability() {
+        let (manager, _) = manager();
+        let result = propose(&manager, 1);
+        let now = chrono::Utc::now().timestamp_millis();
+        let delegation_token = issue_delegation_token(
+            SECRET,
+            "acme",
+            "alice",
+            "checkout",
+            "authorize_order",
+            now + 60_000,
+        )
+        .unwrap();
+        let amended = manager
+            .amend(IntentAmendParams {
+                session_id: result.session_id.clone(),
+                capability_token: result.capability_token.clone(),
+                delegation_token,
+                budget_additions: TypedBudgets {
+                    money_minor_usd_hold: 10_000,
+                    money_minor_usd_capture: 10_000,
+                    database_mutations_count: 0,
+                    custom: HashMap::new(),
+                },
+            })
+            .unwrap();
+        assert_eq!(amended["generation"], 2);
+        assert!(manager
+            .execute_tool(ToolCallParams {
+                name: "stripe.payment_intents.create".to_string(),
+                arguments: json!({"amount_minor": 1000, "customer_id": "cus_9918"}),
+                meta: call_meta(&result, "stale-call"),
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn delegation_tokens_are_single_use() {
+        let (manager, _) = manager();
+        let now = chrono::Utc::now().timestamp_millis();
+        let delegation_token = issue_delegation_token(
+            SECRET,
+            "acme",
+            "alice",
+            "checkout",
+            "authorize_order",
+            now + 60_000,
+        )
+        .unwrap();
+        let params = IntentProposeParams {
+            delegation_token,
             tenant_id: "acme".to_string(),
             principal: "alice".to_string(),
-            agent_role: "support".to_string(),
-            task_intent: "test".to_string(),
-            target_resources: vec![],
-            allowed_tools: vec!["stripe.payment_intents.refund".to_string()],
-            budgets: TypedBudgets::default(),
-            ttl_ms: 30000,
-        }).unwrap();
-
-        mgr.execute_tool(ToolCallParams {
-            name: "stripe.payment_intents.refund".to_string(),
-            arguments: json!({ "amount_minor": 10000 }),
-            meta: Some(crate::protocol::ToolCallMeta {
-                session_id: prop_res.session_id.clone(),
-                capability_token: prop_res.capability_token.clone(),
-                generation: 1,
-                idempotency_key: None,
-            }),
-        }).unwrap();
-
-        let abort_res = mgr.abort(IntentAbortParams {
-            session_id: prop_res.session_id,
-            capability_token: prop_res.capability_token,
-            reason: "Fault injection simulated".to_string(),
-        }).unwrap();
-
-        assert_eq!(abort_res.get("status").unwrap(), "ABORTED");
-        assert_eq!(abort_res.get("reverted_actions_count").unwrap(), 1);
+            agent_role: "checkout".to_string(),
+            task_intent: "authorize_order".to_string(),
+            target_resources: vec!["order:ord_1042".to_string()],
+            allowed_tools: vec!["postgres.orders.update".to_string()],
+            budgets: TypedBudgets {
+                database_mutations_count: 1,
+                ..TypedBudgets::default()
+            },
+            ttl_ms: 30_000,
+        };
+        manager.propose(params.clone()).unwrap();
+        assert!(manager.propose(params).is_err());
     }
 }

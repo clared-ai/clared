@@ -1,128 +1,145 @@
 # Clared
 
-> **Status:** Experimental reference implementation for safe multi-step agent execution. Seeking reviews, fault-injection attacks, and feedback.
+[![CI](https://github.com/clared-ai/clared/actions/workflows/ci.yml/badge.svg)](https://github.com/clared-ai/clared/actions/workflows/ci.yml)
 
-Clared is an execution proxy and middleware for autonomous AI agents. It intercepts tool calls, evaluates policy invariants in memory, manages database transaction savepoints, reserves API holds, and settles multi-step operations safely.
+> **Status:** Experimental security reference implementation. The current backend is an in-memory simulator: it enforces the envelope protocol but does not contact databases, payment providers, or notification services.
 
-## The core problem: Multi-step execution safety
+Clared explores a specific failure mode in action-taking agents: every tool call can be individually authorized while the multi-step operation still produces an unsafe aggregate outcome.
 
-Most agent authorization tools check permissions per call. But in multi-step workflows, **individually authorized actions can still produce an unsafe aggregate outcome.**
+An order agent might update a database, authorize a payment, and notify a customer. If a late step fails, a per-call gateway cannot by itself reconcile the state already created by earlier calls. Clared places the whole operation inside a bounded execution session, meters aggregate budgets, stages actions through declared adapters, revalidates policy at seal time, and reports the final outcome explicitly.
 
-Consider an agent resolving a customer dispute:
-1. **Step 1**: It queries an order database (allowed).
-2. **Step 2**: It updates the database record to `status = 'refunded'` (allowed).
-3. **Step 3**: It calls Stripe to issue a $500 refund (allowed).
-4. **Step 4**: It calls Twilio to send a confirmation SMS (allowed).
+## Run the fault-injection demo
 
-If the model crashes, gets injected, or hits a network partition on Step 3, the database is updated, the refund is unissued, and the user receives no notification.
+The demo compares an unsafe workflow with the Clared reference simulator. No external accounts or API keys are required.
 
-Traditional gateways cannot fix this because they do not coordinate state across steps.
+```bash
+git clone https://github.com/clared-ai/clared.git
+cd clared
+export CLARED_DELEGATION_SECRET=0123456789abcdef0123456789abcdef
 
-## How Clared works
-
-Clared manages the entire agent trajectory as a bounded execution session:
-
-```
-Agent Runtime (LangGraph / Python)
-          │
-          │ 1. `intent/propose` (Declares aggregate budgets & resource targets)
-          ▼
-┌────────────────────────────────────────────────────────┐
-│                      Clared Proxy                      │
-│                                                        │
-│  - In-Memory Policy Evaluation (<0.2ms)                │
-│  - Minor-Unit Integer Budgets (money.minor.USD: 50000) │
-│  - Generation Fencing (`gen: 1 -> gen: 2`)             │
-└──────────────┬──────────────────────────┬──────────────┘
-               │                          │
-   2. Tools Call (Staging)    3. `intent/seal` (Settlement)
-               ▼                          ▼
-┌──────────────────────────────┐   ┌────────────────────────────────┐
-│       STAGING PRIMITIVES     │   │     COORDINATED SETTLEMENT     │
-│ • Database: Pinned Tx BEGIN  │──►│ 1. Capture Stripe Hold         │
-│ • Stripe: Auth Hold (Manual) │   │ 2. Commit Database Tx          │
-│ • Twilio: RAM Buffer         │   │ 3. Flush Buffered Notifications│
-└──────────────────────────────┘   └────────────────────────────────┘
+# Terminal 1
+cd clared-core
+cargo run
 ```
 
-1. **Aggregate multi-dimensional budgets**: Tracks integer minor-unit limits (such as `50000` for $500.00) in memory. Floating-point values are prohibited.
-2. **Connection-pinned database transactions (Mode 1)**: Pins a database connection and executes `BEGIN ... SAVEPOINT`. The agent sees its own writes, while the production database remains protected until seal.
-3. **Two-phase reservations (Mode 3)**: Uses API hold features (such as `capture_method=manual` in Stripe) to get genuine provider IDs without settling funds.
-4. **Topological sink buffering**: Holds user-facing notifications (SMS, email, Slack) in RAM until all database writes and payment captures succeed.
-5. **Explicit partial outcome reporting**: If an unrecoverable failure occurs during settlement, Clared marks the session as `PARTIALLY_SETTLED`, executes declared compensators, and emits a signed incident receipt.
+```bash
+# Terminal 2, from the repository root
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ./clared-python
+python examples/fault_injection_demo.py
+```
 
----
+Expected comparison:
+
+```text
+Unsafe baseline: inconsistent state
+Clared failure path: ABORTED, 2 simulated actions reverted, 0 escaped
+Clared success path: SETTLED with SHA-256 evidence and Ed25519 signature
+```
+
+## What is enforced now
+
+| Boundary | Reference implementation |
+| --- | --- |
+| Delegation | Single-use HMAC-SHA256 proof binds tenant, principal, role, intent, expiry, and nonce |
+| Capability | Short-lived Ed25519-signed token bound to one session and generation |
+| Tool access | Fail-closed allowlist; every allowed tool must have a registered adapter |
+| Resource scope | Adapter-declared argument types must match a qualified envelope target |
+| Aggregate budgets | Integer-only typed dimensions, including money, mutations, and notifications |
+| Lifecycle | Expiry and terminal states are enforced; settled or aborted sessions cannot execute |
+| Replay control | Tool, seal, and abort requests use scoped idempotency keys |
+| Commit evidence | Canonical outcome evidence is SHA-256 hashed and Ed25519 signed |
+
+Provider execution is deliberately simulated. Responses are labeled `in_memory_simulator` and use `SIMULATED_*` statuses. Real PostgreSQL, Stripe, and Twilio executors are future integration work.
+
+## How the boundary fits together
+
+```text
+Trusted harness
+  │  signed delegation proof
+  ▼
+intent/propose ──► Clared policy + envelope admission
+  │                         │
+  │                         └── Ed25519 session capability
+  ▼
+tools/call ─────► allowlist + scope + budget + Cedar + idempotency
+  │
+  ├── intent/abort ──► discard all simulated staged actions
+  │
+  └── intent/seal ───► revalidate policy, settle in declared order,
+                       sign the outcome evidence
+```
+
+The agent should not possess downstream credentials. A production boundary requires every mutating path to terminate at the enforcing proxy; the Python helper alone is not a sandbox.
+
+## Open specifications
+
+The contracts are Apache-2.0 licensed and independently implementable.
+
+| Specification | Governs | Status |
+| --- | --- | --- |
+| [Clared Execution Envelope](specs/execution-envelope.md) | Delegation, capabilities, budgets, resource scope, lifecycle, idempotency, and receipts | `v0alpha1` |
+| [Clared Settlement Adapter](specs/settlement-adapters.md) | How a tool declares staging, settlement, rollback, resource extraction, and budget accounting | `v0alpha1` |
+
+See [specs/README.md](specs/README.md) for versioning and contribution guidance.
+
+## Python integration
+
+Use `ClaredSession.call_tool` for every mutating action:
+
+```python
+from clared import ClaredHarness
+
+harness = ClaredHarness()
+
+async with harness.session(
+    tenant_id="acme",
+    principal="alice",
+    agent_role="checkout_agent",
+    task_intent="authorize_order_1042",
+    target_resources=["order:ord_1042", "customer:cus_9918"],
+    allowed_tools=["postgres.orders.update", "stripe.payment_intents.create"],
+    budgets={
+        "database.mutations.count": 1,
+        "money.minor.USD.hold": 50000,
+        "money.minor.USD.capture": 50000,
+    },
+) as session:
+    await session.call_tool(
+        "postgres.orders.update",
+        {"order_id": "ord_1042", "status": "payment_authorized"},
+        idempotency_key="order-1042-update-v1",
+    )
+```
+
+`with_clared_session` is a convenience that injects this client into a workflow. It cannot prevent bypass unless direct credentials and alternate egress paths are removed.
+
+## Non-guarantees
+
+Clared does not claim universal distributed ACID across arbitrary APIs. A future live executor will coordinate adapter-defined reservations, transactions, and compensators, but partial provider failures must still be represented as explicit degraded states. The current release proves the envelope and lifecycle mechanics against an in-memory simulator only.
 
 ## Repository layout
 
-```
-.
-├── clared-core/           # Rust execution proxy & policy engine
-├── clared-python/         # Python / LangGraph harness middleware
-├── adapters/              # Declarative YAML adapters (Stripe, Postgres, Twilio)
-├── docs/                  # Reference specifications
-│   ├── execution-envelope-spec.md
-│   └── settlement-adapters-spec.md
-└── examples/              # End-to-end runnable integration examples
+```text
+clared-core/       Rust JSON-RPC service, policy engine, capabilities, sessions
+clared-python/     Explicit Python harness and tool client
+adapters/          Versioned settlement adapter declarations
+specs/             Open execution-envelope and adapter specifications
+examples/          Runnable fault-injection comparison
 ```
 
----
+## Development
 
-## Local development
-
-### Prerequisites
-- Rust 1.75+ (`cargo`)
-- Python 3.10+
-
-### Build the Rust proxy
 ```bash
 cd clared-core
-cargo build --release
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 cargo test
+
+cd ../clared-python
+pip install -e ".[dev]"
+pytest -v
 ```
 
-### Install the Python SDK locally
-```bash
-cd clared-python
-pip install -e .
-```
-
----
-
-## Python / LangGraph middleware example
-
-```python
-from clared import protect_agent
-from my_agent import billing_graph
-
-# Wrap an existing LangGraph or Python callable
-safe_agent = protect_agent(
-    billing_graph,
-    sidecar_url="http://localhost:4000",
-    budget={
-        "money.minor.USD.capture": 50000,   # $500.00 max
-        "database.mutations.count": 5
-    },
-    allowed_tools=[
-        "stripe.payment_intents.refund",
-        "postgres.orders.update"
-    ],
-    target_resources=["customer:cus_9918"]
-)
-
-# Run the agent normally
-result = await safe_agent.invoke({"dispute_id": "1042"})
-```
-
----
-
-## Specifications
-
-- [Execution Envelope Specification](docs/execution-envelope-spec.md)
-- [Settlement Adapters Specification](docs/settlement-adapters-spec.md)
-
----
-
-## License
-
-Apache-2.0. See [LICENSE](LICENSE) for details.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Licensed under [Apache-2.0](LICENSE).

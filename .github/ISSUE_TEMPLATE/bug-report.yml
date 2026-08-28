@@ -1,0 +1,35 @@
+name: Bug report
+description: Report a reproducible implementation or documentation defect.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Security boundary bypasses must be reported privately under SECURITY.md, not here.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: What happened, including the exact error or receipt when relevant?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include commands, protocol payloads, and adapter declarations needed to reproduce it.
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: Commit SHA or release version.
+    validations:
+      required: true

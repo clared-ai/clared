@@ -1,0 +1,42 @@
+name: Protocol proposal
+description: Propose a falsifiable change to an open Clared contract.
+title: "[protocol] "
+labels: ["protocol"]
+body:
+  - type: dropdown
+    id: specification
+    attributes:
+      label: Specification
+      options:
+        - Execution Envelope
+        - Settlement Adapter
+        - Both
+    validations:
+      required: true
+  - type: textarea
+    id: failure-mode
+    attributes:
+      label: Concrete failure mode
+      description: What unsafe or ambiguous behavior does the current contract permit?
+    validations:
+      required: true
+  - type: textarea
+    id: wire-change
+    attributes:
+      label: Proposed contract change
+      description: Show wire or adapter examples where possible.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and security impact
+    validations:
+      required: true
+  - type: textarea
+    id: conformance
+    attributes:
+      label: Conformance test
+      description: Describe a test that fails before the change and passes after it.
+    validations:
+      required: true

@@ -78,47 +78,69 @@ impl CedarEngine {
         resource_id: &str,
         context_json: &Value,
     ) -> PolicyOutcome {
-        let principal = EntityUid::from_str(&format!("User::\"{}\"", principal_id))
-            .unwrap_or_else(|_| EntityUid::from_str("User::\"anonymous\"").unwrap());
-
-        let action = EntityUid::from_str(&format!("Action::\"{}\"", action_name))
-            .unwrap_or_else(|_| EntityUid::from_str("Action::\"unknown\"").unwrap());
-
-        let resource = EntityUid::from_str(&format!("Resource::\"{}\"", resource_id))
-            .unwrap_or_else(|_| EntityUid::from_str("Resource::\"default\"").unwrap());
-
-        // Construct Cedar context from JSON arguments
-        let context = Context::from_json_value(context_json.clone(), None)
-            .unwrap_or_else(|_| Context::empty());
-
-        let entities = Entities::empty();
-
-        let request = match Request::new(
-            Some(principal),
-            Some(action),
-            Some(resource),
-            context,
-            None,
-        ) {
-            Ok(req) => req,
-            Err(e) => {
+        let principal = match EntityUid::from_str(&format!("User::\"{}\"", principal_id)) {
+            Ok(value) => value,
+            Err(error) => {
                 return PolicyOutcome::Deny {
-                    violating_policies: vec!["MALFORMED_REQUEST".to_string()],
-                    reason: format!("Failed to construct Cedar request: {}", e),
+                    violating_policies: vec!["MALFORMED_PRINCIPAL".to_string()],
+                    reason: format!("Principal identifier is invalid: {error}"),
                 };
             }
         };
 
-        let response: Response = self.authorizer.is_authorized(&request, &self.policy_set, &entities);
+        let action = match EntityUid::from_str(&format!("Action::\"{}\"", action_name)) {
+            Ok(value) => value,
+            Err(error) => {
+                return PolicyOutcome::Deny {
+                    violating_policies: vec!["MALFORMED_ACTION".to_string()],
+                    reason: format!("Action identifier is invalid: {error}"),
+                };
+            }
+        };
+
+        let resource = match EntityUid::from_str(&format!("Resource::\"{}\"", resource_id)) {
+            Ok(value) => value,
+            Err(error) => {
+                return PolicyOutcome::Deny {
+                    violating_policies: vec!["MALFORMED_RESOURCE".to_string()],
+                    reason: format!("Resource identifier is invalid: {error}"),
+                };
+            }
+        };
+
+        // Construct Cedar context from JSON arguments
+        let context = match Context::from_json_value(context_json.clone(), None) {
+            Ok(value) => value,
+            Err(error) => {
+                return PolicyOutcome::Deny {
+                    violating_policies: vec!["MALFORMED_CONTEXT".to_string()],
+                    reason: format!("Policy context is invalid: {error}"),
+                };
+            }
+        };
+
+        let entities = Entities::empty();
+
+        let request =
+            match Request::new(Some(principal), Some(action), Some(resource), context, None) {
+                Ok(req) => req,
+                Err(e) => {
+                    return PolicyOutcome::Deny {
+                        violating_policies: vec!["MALFORMED_REQUEST".to_string()],
+                        reason: format!("Failed to construct Cedar request: {}", e),
+                    };
+                }
+            };
+
+        let response: Response =
+            self.authorizer
+                .is_authorized(&request, &self.policy_set, &entities);
 
         match response.decision() {
             Decision::Allow => PolicyOutcome::Allow,
             Decision::Deny => {
                 let diagnostics = response.diagnostics();
-                let reasons: Vec<String> = diagnostics
-                    .reason()
-                    .map(|r| r.to_string())
-                    .collect();
+                let reasons: Vec<String> = diagnostics.reason().map(|r| r.to_string()).collect();
 
                 let desc = if reasons.is_empty() {
                     "Action denied by default closed-world policy boundary".to_string()

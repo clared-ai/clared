@@ -1,0 +1,26 @@
+version: "clared.dev/settlement-adapter/v0alpha1"
+metadata:
+  name: "postgres_orders_adapter"
+  description: "Reference transaction adapter for order mutations"
+  provider: "postgresql"
+  version: "0.1.0"
+
+targets:
+  - tool_name: "postgres.orders.update"
+    resource_arguments:
+      - argument: "order_id"
+        scope_prefix: "order"
+    budget_charges:
+      - dimension: "database.mutations.count"
+        constant: 1
+    settlement_order: 10
+
+mode: MODE_1_SQL
+
+execution:
+  staging:
+    strategy: SHADOW_TRANSACTION
+  settlement:
+    strategy: COMMIT_TX
+  rollback:
+    strategy: ROLLBACK_TX

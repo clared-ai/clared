@@ -1,4 +1,4 @@
-version: "openadapter/v1"
+version: "clared.dev/settlement-adapter/v0alpha1"
 metadata:
   name: "stripe_payment_intent_adapter"
   description: "Two-phase reservation adapter for Stripe PaymentIntents"
@@ -8,6 +8,15 @@ metadata:
 targets:
   - tool_name: "stripe.payment_intents.create"
     http_route: "POST /v1/payment_intents"
+    resource_arguments:
+      - argument: "customer_id"
+        scope_prefix: "customer"
+    budget_charges:
+      - dimension: "money.minor.USD.hold"
+        argument: "amount_minor"
+      - dimension: "money.minor.USD.capture"
+        argument: "amount_minor"
+    settlement_order: 20
 
 mode: MODE_3_RESERVATION
 
@@ -21,7 +30,7 @@ execution:
       entity_id_path: "$.id"
 
   settlement:
-    strategy: ATOMIC_CAPTURE
+    strategy: CAPTURE_AUTH
     http_method: POST
     endpoint: "/v1/payment_intents/{{staged_entity_id}}/capture"
 
@@ -29,11 +38,3 @@ execution:
     strategy: CANCEL_AUTH
     http_method: POST
     endpoint: "/v1/payment_intents/{{staged_entity_id}}/cancel"
-
-  compensation:
-    strategy: ARCHIVE_INCIDENT
-    http_method: POST
-    endpoint: "/v1/refunds"
-    body:
-      payment_intent: "{{staged_entity_id}}"
-      reason: "duplicate"

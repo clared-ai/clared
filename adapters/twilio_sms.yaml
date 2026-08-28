@@ -1,4 +1,4 @@
-version: "openadapter/v1"
+version: "clared.dev/settlement-adapter/v0alpha1"
 metadata:
   name: "twilio_sms_adapter"
   description: "Topological egress sink adapter for Twilio SMS"
@@ -8,6 +8,10 @@ metadata:
 targets:
   - tool_name: "twilio.messages.create"
     http_route: "POST /2010-04-01/Accounts/{AccountSid}/Messages.json"
+    budget_charges:
+      - dimension: "external_notifications.count"
+        constant: 1
+    settlement_order: 100
 
 mode: EGRESS_SINK
 

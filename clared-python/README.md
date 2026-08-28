@@ -1,23 +1,11 @@
-# Clared Python SDK
+# Clared Python client
 
-Python client and LangGraph / CrewAI middleware for Clared execution firewalls.
-
-## Installation
+Python client for the Clared execution-envelope reference implementation.
 
 ```bash
 pip install -e .
 ```
 
-## Usage
+The client opens authenticated sessions and routes explicit calls through `ClaredSession.call_tool`. It does not sandbox an existing framework automatically. A hard boundary requires withholding downstream credentials and removing alternate egress paths.
 
-```python
-from clared import protect_agent
-
-# Wrap an existing LangGraph or Python workflow
-safe_agent = protect_agent(
-    my_agent_graph,
-    sidecar_url="http://localhost:4000",
-    budget={"money.minor.USD.capture": 50000},
-    allowed_tools=["stripe.refund", "postgres.orders.update"]
-)
-```
+See the repository [README](../README.md#python-integration) and [fault-injection demo](../examples/fault_injection_demo.py).
