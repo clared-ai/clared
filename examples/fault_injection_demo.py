@@ -12,14 +12,19 @@ SECRET = "0123456789abcdef0123456789abcdef"
 def run_unsafe_baseline() -> None:
     order = {"id": "ord_1042", "status": "pending"}
     payment_authorized = False
+    notification_sent = False
     print("\n1. Unsafe baseline")
     try:
         order["status"] = "payment_authorized"
-        raise ConnectionError("injected network failure before payment authorization")
+        payment_authorized = True
+        raise ConnectionError("injected network failure before notification")
     except ConnectionError as error:
+        print("   database update: committed immediately")
+        print("   payment: authorized (hold left open)")
         print(f"   injected failure: {error}")
-    print(f"   order status escaped: {order['status']}")
-    print(f"   payment authorized: {payment_authorized}")
+    print(f"   order status: {order['status']}")
+    print(f"   notification sent: {notification_sent}")
+    print("   rollback: none")
     print("   result: inconsistent state")
 
 

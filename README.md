@@ -4,7 +4,7 @@
 
 > **Status:** Experimental open-source reference implementation on an in-memory simulator. It enforces the execution envelope end-to-end but does not contact databases, payment providers, or notification services. See [Status: shipped vs target](#status-shipped-vs-target) for the exact split.
 
-Clared lets teams authorize agent workflows that are too risky to run today: the agent gets a broad tool surface inside a stateful, revocable execution session, without holding unrestricted downstream credentials.
+Clared's thesis: teams should be able to authorize agent workflows that are too risky to run today — the agent gets a broad tool surface inside a stateful, revocable execution session, without holding unrestricted downstream credentials. This repository proves the boundary mechanics on an in-memory simulator; wiring real providers is future integration work.
 
 ## The problem
 
@@ -30,7 +30,7 @@ The agent never holds downstream credentials. Unexpected authority requires a ne
 
 ## Quickstart
 
-The fault-injection demo compares an unsafe workflow with the same workflow behind the Clared boundary. No external accounts or API keys are required. Requirements: Rust, Python 3.10+; `uv` is used when available.
+The fault-injection demo runs the same three-step workflow — database update, payment authorization, notification — twice with the same injected failure before the final step: once with no boundary, once behind Clared. No external accounts or API keys are required. Requirements: Rust, Python 3.10+; `uv` is used when available.
 
 ```bash
 git clone https://github.com/clared-ai/clared.git
@@ -38,12 +38,16 @@ cd clared
 make demo
 ```
 
-Expected output:
+Expected output (evidence digest and signature differ on every run):
 
 ```text
 1. Unsafe baseline
-   injected failure: injected network failure before payment authorization
-   order status escaped: payment_authorized
+   database update: committed immediately
+   payment: authorized (hold left open)
+   injected failure: injected network failure before notification
+   order status: payment_authorized
+   notification sent: False
+   rollback: none
    result: inconsistent state
 
 2. Clared path with the same injected failure
@@ -191,6 +195,10 @@ Clared does not claim universal distributed ACID across arbitrary APIs. A future
 Clared also cannot infer every harmful business outcome. It can enforce only authority, policies, invariants, state, and provider effects that are formalized and observable at the boundary. Unknown or unmodeled risk still requires conservative defaults, scoped rollout, monitoring, and human escalation.
 
 See [ROADMAP.md](ROADMAP.md) for the evidence-gated path to a certified lifecycle boundary, MCP-compatible enforcement, a real PostgreSQL transaction executor, conformance fixtures, and installable releases.
+
+## Challenge the boundary
+
+We are looking for teams with a consequential agent workflow that is still read-only, manually approved, narrowly scoped, or otherwise blocked from broader production autonomy. [Challenge the protocol in Discussions](https://github.com/clared-ai/clared/discussions), or email [liran@clared.ai](mailto:liran@clared.ai) to evaluate what control and evidence would be required to turn that workflow on safely.
 
 ## Repository layout
 

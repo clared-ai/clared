@@ -1,7 +1,7 @@
 # Clared Settlement Adapter — Lease and Prepare-Fence Draft
 
-**Proposed version:** `clared.dev/settlement-adapter/v0alpha2-draft`  
-**Status:** Design draft; not implemented by the current reference server  
+**Proposed version:** `clared.dev/settlement-adapter/v0alpha2-draft`
+**Status:** Design draft; not implemented by the current reference server
 **License:** Apache-2.0
 
 ## 1. Scope

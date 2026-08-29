@@ -1,7 +1,7 @@
 # Clared Execution Envelope — Prepare-Fence Draft
 
-**Proposed version:** `clared.dev/execution-envelope/v0alpha2-draft`  
-**Status:** Design draft; not implemented by the current reference server  
+**Proposed version:** `clared.dev/execution-envelope/v0alpha2-draft`
+**Status:** Design draft; not implemented by the current reference server
 **License:** Apache-2.0
 
 ## 1. Scope
