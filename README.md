@@ -2,21 +2,35 @@
 
 [![CI](https://github.com/clared-ai/clared/actions/workflows/ci.yml/badge.svg)](https://github.com/clared-ai/clared/actions/workflows/ci.yml)
 
-> **Status:** Experimental security reference implementation. The current backend is an in-memory simulator: it enforces the envelope protocol but does not contact databases, payment providers, or notification services.
+> **Status:** Experimental open-source reference implementation on an in-memory simulator. It enforces the execution envelope end-to-end but does not contact databases, payment providers, or notification services. See [Status: shipped vs target](#status-shipped-vs-target) for the exact split.
 
-Clared explores how enterprises can grant agents broader operational authority without handing them unrestricted credentials. The agent may choose a flexible tool trajectory, but every mutating effect must cross a stateful, revocable execution boundary that constrains tools, resources, cumulative budgets, lifecycle, and settlement.
+Clared lets teams authorize agent workflows that are too risky to run today: the agent gets a broad tool surface inside a stateful, revocable execution session, without holding unrestricted downstream credentials.
 
-In practice, the blocker is not agent capability but blast radius: the wider the action space, the less a risk review will approve, so capable agents stay read-only, narrowly scoped, or gated behind per-click human approval. Clared decouples action space from blast radius — a broad tool surface under hard, auditable session ceilings — so autonomy does not have to be purchased with unrestricted credentials.
+## The problem
 
-One important failure mode is that every tool call can be individually authorized while the multi-step operation still produces an unsafe aggregate outcome. Clared therefore treats the bounded run—not an isolated call—as the unit of authority and evidence.
+Agents can usually do the work. Teams still cannot safely let them.
 
-An order agent might update a database, authorize a payment, and notify a customer. If a late step fails, a per-call gateway cannot by itself reconcile the state already created by earlier calls. Clared places the whole operation inside a bounded execution session, meters aggregate budgets, stages actions through declared adapters, revalidates policy at seal time, and reports the final outcome explicitly.
+- **Useful access becomes broad access.** A flexible agent needs many tools and credentials. Once those credentials reach the agent runtime, one wrong branch can affect any reachable customer, account, or production resource.
+- **Safe calls can form an unsafe run.** Every tool call can be individually authorized while the multi-step operation still breaches a cumulative budget, skips a required state transition, or proceeds after the underlying business state has changed. Per-call approval does not see the aggregate.
+- **Real systems do not roll back together.** A database write, a payment authorization, and a notification settle differently. A late failure can leave earlier effects committed, forcing manual repair — which is exactly why risk reviews keep these agents read-only, narrowly scoped, or approved one click at a time.
 
-We are looking for teams with a consequential agent workflow that is still read-only, manually approved, narrowly scoped, or otherwise blocked from broader production autonomy. [Challenge the protocol in Discussions](https://github.com/clared-ai/clared/discussions), or email [liran@clared.ai](mailto:liran@clared.ai) to evaluate what control and evidence would be required to turn that workflow on safely.
+The wider the action space, the less a risk review will approve. The blocker is not agent capability; it is blast radius.
 
-## Run the fault-injection demo
+## The approach
 
-The demo compares an unsafe workflow with the Clared reference simulator. No external accounts or API keys are required. It requires Rust and Python 3.10+; `uv` is used when available.
+Clared decouples action space from blast radius. The agent stays free to choose its tool trajectory, but every mutating effect crosses a stateful execution boundary that:
+
+- binds the whole run — not each call — to one signed delegation and session capability,
+- meters cumulative typed budgets (money, mutations, notifications) across the run,
+- stages provider actions through declared settlement adapters instead of executing them inline,
+- revalidates default-deny policy at seal time, when the full run is visible,
+- aborts and reverts staged actions on failure, and emits SHA-256-hashed, Ed25519-signed outcome evidence.
+
+The agent never holds downstream credentials. Unexpected authority requires a newly delegated capability.
+
+## Quickstart
+
+The fault-injection demo compares an unsafe workflow with the same workflow behind the Clared boundary. No external accounts or API keys are required. Requirements: Rust, Python 3.10+; `uv` is used when available.
 
 ```bash
 git clone https://github.com/clared-ai/clared.git
@@ -24,15 +38,41 @@ cd clared
 make demo
 ```
 
-Expected comparison:
+Expected output:
 
 ```text
-Unsafe baseline: inconsistent state
-Clared failure path: ABORTED, 2 simulated actions reverted, 0 escaped
-Clared success path: SETTLED with SHA-256 evidence and Ed25519 signature
+1. Unsafe baseline
+   injected failure: injected network failure before payment authorization
+   order status escaped: payment_authorized
+   result: inconsistent state
+
+2. Clared path with the same injected failure
+   database: SIMULATED_STAGED_TX
+   payment: SIMULATED_AUTH_HOLD
+   injected failure: injected network failure before notification
+   final state: ABORTED
+   reverted simulated actions: 2
+   escaped side effects: 0
+
+3. Successful simulated settlement
+   final state: SETTLED
+   backend: in_memory_simulator
+   evidence: sha256:<64-hex digest, unique per run>
+   signature: ed25519:<base64 signature, unique per run>
 ```
 
-## What is enforced now
+A recorded run is available at [docs/demo/demo.cast](docs/demo/demo.cast):
+
+```bash
+brew install asciinema   # one-time
+asciinema play docs/demo/demo.cast
+```
+
+## Status: shipped vs target
+
+This repository proves the `v0alpha1` execution-envelope profile against an in-memory simulator. Everything else in the docs is target architecture until implemented and verified.
+
+**Implemented and enforced today (`v0alpha1`, in-memory simulator):**
 
 | Boundary | Reference implementation |
 | --- | --- |
@@ -46,7 +86,21 @@ Clared success path: SETTLED with SHA-256 evidence and Ed25519 signature
 | Replay control | Tool, seal, and abort requests use scoped idempotency keys |
 | Commit evidence | Deterministically serialized outcome evidence is SHA-256 hashed and Ed25519 signed |
 
-Provider execution is deliberately simulated. Responses are labeled `in_memory_simulator` and use `SIMULATED_*` statuses. Real PostgreSQL, Stripe, and Twilio executors are future integration work.
+Provider execution is deliberately simulated. Responses are labeled `in_memory_simulator` and use `SIMULATED_*` statuses.
+
+**Target architecture (not implemented — proposals and drafts only):**
+
+| Target | Where it is specified |
+| --- | --- |
+| Certified Semantic Run Supervisor with separate lifecycle authority; supervisor-authenticated `intent/quiesce`, atomic admission fence, durable `PREPARED` state | [Execution Envelope prepare-fence draft](specs/execution-envelope-v0alpha2-draft.md) |
+| Progressive obligation feedback: staged actions carry signed obligation deltas and Clared-rendered guidance in ordinary tool results | [Execution Envelope prepare-fence draft](specs/execution-envelope-v0alpha2-draft.md) |
+| Provisional root answers with signed `REPLAN_REQUIRED` suspension and bounded terminal repair | [Execution Envelope prepare-fence draft](specs/execution-envelope-v0alpha2-draft.md) |
+| Trusted obligation facts, deterministic closure, physical/provider leases, drain and ambiguity rules | [Settlement Adapter lease draft](specs/settlement-adapter-v0alpha2-draft.md) |
+| Real executors: PostgreSQL transactions with hard leases, payment holds, notification egress | [ROADMAP.md](ROADMAP.md) |
+| MCP-compatible enforcement shim (shadow, deny-only, or per-call until a trustworthy root boundary exists) | [ROADMAP.md](ROADMAP.md) |
+| Conformance fixtures, certified framework adapters, `clared run` / `clared doctor` | [ROADMAP.md](ROADMAP.md) |
+
+In particular: `intent/seal` by an explicit harness is the shipped completion path today. The quiesce/prepare-fence lifecycle, obligation steering, and "atomic settlement" language describe the proposed target, not current behavior.
 
 ## How the boundary fits together
 
@@ -77,12 +131,10 @@ Clared is not a replacement for the systems below. It adds a stateful authority 
 | Category | Primary job | What remains outside it that Clared targets |
 | --- | --- | --- |
 | Durable workflow engines (for example Temporal or Restate) | Reliably execute an application-defined workflow | Bound authority for a non-deterministic sequence selected by an agent |
-| Policy engines (Cedar or OPA) | Decide whether one request is allowed from current facts | Track aggregate budgets and staged effects across calls, then revalidate at seal time |
+| Policy engines (Cedar or OPA) | Decide whether one request is allowed from current facts | Track aggregate budgets, staged effects, and co-requisite obligations across calls; guide the active agent and revalidate at settlement |
 | LLM gateways | Govern model traffic, cost, routing, and observability | Govern downstream mutations after the model chooses an action |
 | Sandboxed runtimes | Isolate code, processes, files, or network access | Express which business effects may accumulate and how they settle |
 | Tool gateways and MCP permission layers | Expose tools and approve or deny individual calls | Bind the whole multi-tool operation to one capability, resource set, budget, lifecycle, and receipt |
-
-The proposed unit is the combination: session-scoped authority, aggregate typed budgets, adapter-declared staged effects, commit-time policy revalidation, and signed terminal evidence.
 
 Cedar is the deterministic authorization evaluator, not the trajectory engine by itself. A production implementation must derive trusted facts from session history and real systems, construct the execution dependency graph incrementally as actions are staged, and evaluate run-level invariants before settlement.
 
@@ -94,6 +146,8 @@ The contracts are Apache-2.0 licensed and independently implementable.
 | --- | --- | --- |
 | [Clared Execution Envelope](specs/execution-envelope.md) | Delegation, capabilities, budgets, resource scope, lifecycle, idempotency, and receipts | `v0alpha1` |
 | [Clared Settlement Adapter](specs/settlement-adapters.md) | How a tool declares staging, settlement, rollback, resource extraction, and budget accounting | `v0alpha1` |
+| [Execution Envelope — Prepare-Fence Draft](specs/execution-envelope-v0alpha2-draft.md) | Proposed progressive obligation feedback, semantic supervisor, lifecycle authority, quiescence fence, terminal repair, child and streaming semantics | `v0alpha2-draft` — not implemented |
+| [Settlement Adapter — Lease Draft](specs/settlement-adapter-v0alpha2-draft.md) | Proposed trusted obligation facts, deterministic closure, physical/provider leases, repair compatibility, drain evidence and ambiguity rules | `v0alpha2-draft` — not implemented |
 
 See [specs/README.md](specs/README.md) for versioning and contribution guidance.
 
@@ -136,7 +190,7 @@ Clared does not claim universal distributed ACID across arbitrary APIs. A future
 
 Clared also cannot infer every harmful business outcome. It can enforce only authority, policies, invariants, state, and provider effects that are formalized and observable at the boundary. Unknown or unmodeled risk still requires conservative defaults, scoped rollout, monitoring, and human escalation.
 
-See [ROADMAP.md](ROADMAP.md) for the evidence-gated path to an MCP-compatible shim, a real PostgreSQL transaction executor, conformance fixtures, and installable releases.
+See [ROADMAP.md](ROADMAP.md) for the evidence-gated path to a certified lifecycle boundary, MCP-compatible enforcement, a real PostgreSQL transaction executor, conformance fixtures, and installable releases.
 
 ## Repository layout
 
@@ -145,7 +199,7 @@ clared-core/       Rust JSON-RPC service, policy engine, capabilities, sessions
 clared-python/     Explicit Python harness and tool client
 adapters/          Versioned settlement adapter declarations
 specs/             Open execution-envelope and adapter specifications
-docs/              Threat model and security analysis
+docs/              Threat model, security analysis, and demo recording
 examples/          Runnable fault-injection comparison
 ```
 

@@ -1,0 +1,6 @@
+{"version": 2, "width": 100, "height": 30, "timestamp": 1788013602, "duration": 2.554349, "env": {"SHELL": "/bin/zsh", "TERM": "xterm-256color"}, "title": "Clared fault-injection demo (make demo) \u2014 in-memory simulator"}
+[2.35388, "o", "Clared fault-injection reference demo\r\nBackend: in-memory simulator; no external systems are contacted\r\n\r\n1. Unsafe baseline\r\n   injected failure: injected network failure before payment authorization\r\n   order status escaped: payment_authorized\r\n   payment authorized: False\r\n   result: inconsistent state\r\n\r\n2. Clared path with the same injected failure\r\n"]
+[2.468563, "o", "   database: SIMULATED_STAGED_TX\r\n   payment: SIMULATED_AUTH_HOLD\r\n"]
+[2.470659, "o", "   injected failure: injected network failure before notification\r\n   final state: ABORTED\r\n   reverted simulated actions: 2\r\n"]
+[2.470714, "o", "   escaped side effects: 0\r\n\r\n3. Successful simulated settlement\r\n"]
+[2.501155, "o", "   final state: SETTLED\r\n   backend: in_memory_simulator\r\n   evidence: sha256:8ca8aabad20fe6c3e2d570eaa8b89d050d52c6874ac45437708f5ab37d27ca10\r\n   signature: ed25519:ma9Sj2-O_sbZi4NpOU62rOh1...\r\n"]
