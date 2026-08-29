@@ -4,6 +4,8 @@
 **Status:** Experimental reference specification  
 **License:** Apache-2.0
 
+> This is the implemented `v0alpha1` contract. The non-implemented [prepare-fence `v0alpha2` draft](execution-envelope-v0alpha2-draft.md) proposes progressive obligation feedback, separate lifecycle authority, and a deterministic quiescence handshake; it does not change this profile.
+
 ## 1. Scope
 
 An execution envelope establishes session-level authority for a non-deterministic agent operation. It complements per-call authorization by binding a trajectory to:

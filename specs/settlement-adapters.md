@@ -4,6 +4,8 @@
 **Status:** Experimental reference specification  
 **License:** Apache-2.0
 
+> This is the implemented `v0alpha1` contract. The non-implemented [lease and prepare-fence `v0alpha2` draft](settlement-adapter-v0alpha2-draft.md) proposes trusted obligation facts, deterministic closure, physical lease, drain-evidence, and live conformance rules; it does not change this profile.
+
 ## 1. Scope
 
 A settlement adapter declares how one or more tool names participate in an execution envelope. It defines:

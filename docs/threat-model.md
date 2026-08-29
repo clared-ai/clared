@@ -2,7 +2,7 @@
 
 **Profile:** Clared `v0alpha1` reference implementation  
 **Backend:** In-memory simulator  
-**Last reviewed:** 2026-08-28
+**Last reviewed:** 2026-08-29
 
 This document separates the envelope mechanics implemented today from the trust boundaries a live deployment would still need. Finding a case where the implementation reports a safer outcome than it actually achieved is a security defect.
 
@@ -22,6 +22,8 @@ Clared does not attempt to prove that the agent reasoned correctly. It constrain
 | Adapter registry | Trusted configuration. A dishonest adapter can misdescribe resource extraction or settlement behavior. |
 | Execution backend | Simulated today. A live backend must withhold provider credentials from the agent and persist ambiguous outcomes. |
 | Receipt verifier | Must obtain the expected signer public key through a trusted channel; a key embedded only in an untrusted receipt is not sufficient trust. |
+
+The proposed `v0alpha2` design adds a trusted Semantic Run Supervisor and distinct lifecycle credential. Neither is part of the current implementation. See the [prepare-fence draft](../specs/execution-envelope-v0alpha2-draft.md).
 
 ## Attack analysis
 
@@ -44,6 +46,42 @@ Clared does not attempt to prove that the agent reasoned correctly. It constrain
 | Compromised proxy or signing key | Outside the current implementation boundary. | Requires key persistence, rotation, isolation, and operational controls. |
 | Memory exhaustion from unbounded sessions or replay records | No quotas or garbage collection in the reference server. | Known denial-of-service risk; do not expose the simulator as a public service. |
 
+## Target lifecycle threats (`v0alpha2` draft, not implemented)
+
+These are requirements for the proposed design, not current defenses:
+
+| Attack or failure | Required target behavior |
+| --- | --- |
+| Timer, MCP silence, model `finish_reason`, process exit, or socket trace is mistaken for successful task completion | None is a success signal. Live settlement requires a certified semantic root boundary, explicit harness, or one-task managed worker. |
+| Agent steals or forges lifecycle authority | Action and supervisor credentials use distinct types and audiences; lifecycle material stays outside model context; `intent/quiesce` rejects action capabilities. |
+| Tool call races quiescence | One linearizable operation lock orders admission against the fence. The call is assigned a Clared-owned sequence at or below the high-water mark or is rejected after the fence. |
+| Caller omits an action or child from the quiescence request | Caller supplies neither authoritative sequence nor child manifest. Clared snapshots its own admission log and registered child set. |
+| Detached child acts after its parent closes | Parent fencing invalidates child authority; a parent cannot prepare until registered children are prepared or safely terminal. |
+| Root exception, cancellation, or abandoned stream is treated as success | Certified adapters route those events to abort/recovery. Only a certified framework root-success event may request quiescence, and its output remains provisional until settlement. |
+| Process dies before or after preparation | Before preparation, rollback/recovery applies. After durable preparation, recovery resumes the recorded settlement plan idempotently. |
+| Database locks survive model thinking or human approval | Physical transactions open lazily, have hard maximum leases, and roll back or checkpoint before unbounded pauses. Lease expiry never commits. |
+| Provider result is unknown while the epoch drains | Ambiguity blocks preparation or enters `RECOVERY_REQUIRED`; the system never guesses no-effect or success. |
+| Business invariants exist only as prompt instructions | Policy and graph state remain authoritative outside the prompt. Certified profiles surface relevant obligation deltas in ordinary tool results, but enforcement never depends on model compliance. |
+| Agent or provider claims an obligation is satisfied or waived | Only authenticated graph transitions from admitted actions or a policy-authorized principal can resolve it; revision replay is rejected. |
+| Provider-controlled text becomes a high-priority instruction | Clared renders guidance only from approved templates and authenticated facts. Provider/tool free text remains untrusted data. |
+| Required-action guidance silently expands agent authority | Guidance is non-authorizing. The attempted action must still pass the existing capability, resource, budget, policy, and adapter checks. |
+| Client strips obligation metadata or model-visible guidance | The integration cannot be certified for progressive self-correction. Enforcement remains fail-closed and terminal behavior uses its declared resume or block-only capability. |
+| Obligation flooding bloats context or causes a blocker to be truncated | Profiles bound and relevance-filter model-visible snapshots while retaining complete supervisor state. A blocking obligation is never silently omitted; limit exhaustion suspends or fails closed. |
+| Deterministic closure executes an attacker-chosen repair | Closure is allowed only from an approved idempotent recipe whose arguments derive from authenticated state and whose action passes ordinary admission and accounting. |
+| Final response reaches the user before settlement | Integration buffers the final response or marks it provisional. Authoritative success follows a signed terminal receipt. |
+| Terminal validation rejects a repairable candidate after the framework root returned | Clared withholds the candidate, keeps the completed generation fenced, and emits a signed `REPLAN_REQUIRED` suspension with authenticated outstanding obligations. |
+| Delayed work from the completed attempt enters after repair begins | `intent/resume` creates a fresh greater generation and continuation invocation; stale, detached, and replayed work is rejected. |
+| A repair mutates assumptions behind already-staged actions | Same-epoch repair is restricted to monotonic additive work. Non-monotonic repair must roll back or abort the staged branch and restart from a durable checkpoint. |
+| Model steering is attempted for an ambiguous provider result or hard violation | Ambiguity and non-repairable violations follow abort/recovery. They never enter the model repair loop. |
+| Repair loops consume unbounded model, tool, time, or provider capacity | Profiles cap attempts, cumulative wall time, model/tool budgets, and allowed repair classes. Exhaustion aborts or enters recovery. |
+| Framework adapter claims it can steer after root completion but cannot preserve state | Certification distinguishes `RESUME_CAPABLE` from `BLOCK_ONLY`; unsupported or broken resume paths fail closed and return structured application failure. |
+| Block-only integration returns failure but leaves staged effects or a transaction stranded | It aborts/reconciles before returning unless a configured durable orchestrator explicitly accepts suspension ownership; no physical lease may be orphaned. |
+| Suspension silently extends a database or provider lease | Suspension does not pause or renew physical leases. Expiry forces checkpoint restart, abort, or recovery and never permits settlement. |
+| eBPF or socket telemetry is promoted to a completion oracle | OS telemetry is limited to bypass, process-death, and egress evidence and cannot initiate settlement. |
+| Unsupported framework version runs live | `clared doctor` detects missing/incompatible hooks and live mode fails closed unless an operator explicitly selected shadow/per-call behavior. |
+
+The required adversarial suite is enumerated in the draft specification. Promotion to an implemented profile requires executable evidence for every listed race and failure mode.
+
 ## What the current evidence proves
 
 A valid receipt proves that one running reference process produced the stated simulated outcome under its in-memory state and signing key. It does not prove that PostgreSQL, Stripe, Twilio, or any other provider was contacted. It does not prove a universal rollback guarantee.
@@ -57,5 +95,7 @@ The most useful adversarial reports currently are:
 3. An argument shape that bypasses typed accounting or policy context separation.
 4. A receipt that verifies after its evidence is changed.
 5. An adapter declaration whose ambiguity could produce a falsely safe outcome.
+
+For the draft lifecycle, especially useful design reviews include a counterexample to obligation revision ordering, forged resolution, provider-text instruction injection, stripped-delivery certification, deterministic closure derivation, fence linearization, a framework callback that escapes async context or child registration, a streaming path with ambiguous completion, a replay or stale-generation path through terminal repair, a non-monotonic repair incorrectly retained in the same epoch, or an adapter lease path that can settle after expiry.
 
 Report boundary bypasses privately under [SECURITY.md](../SECURITY.md). Use GitHub Discussions for model limitations and protocol design questions.
