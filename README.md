@@ -67,7 +67,7 @@ Expected output (evidence digest and signature differ on every run):
    signature: ed25519:<base64 signature, unique per run>
 ```
 
-A recorded run is available at [docs/demo/demo.cast](docs/demo/demo.cast):
+A 90-second paced recording of a warm `make demo` run is at [docs/demo/demo.cast](docs/demo/demo.cast) (in-memory simulator only):
 
 ```bash
 brew install asciinema   # one-time
