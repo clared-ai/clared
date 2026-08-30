@@ -1,3 +1,4 @@
+# In-memory reference adapter. Does not contact Twilio; this is not live notification egress.
 version: "clared.dev/settlement-adapter/v0alpha1"
 metadata:
   name: "twilio_sms_adapter"

@@ -1,3 +1,4 @@
+# In-memory reference adapter. Does not contact Stripe; this is not a live payment integration.
 version: "clared.dev/settlement-adapter/v0alpha1"
 metadata:
   name: "stripe_payment_intent_adapter"
