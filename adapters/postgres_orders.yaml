@@ -1,3 +1,4 @@
+# In-memory reference adapter. Does not contact PostgreSQL.
 version: "clared.dev/settlement-adapter/v0alpha1"
 metadata:
   name: "postgres_orders_adapter"

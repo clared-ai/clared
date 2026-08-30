@@ -30,7 +30,9 @@ The agent never holds downstream credentials. Unexpected authority requires a ne
 
 ## Quickstart
 
-The fault-injection demo runs the same three-step workflow — database update, payment authorization, notification — twice with the same injected failure before the final step: once with no boundary, once behind Clared. No external accounts or API keys are required. Requirements: Rust, Python 3.10+; `uv` is used when available.
+The fault-injection demo runs the same three-step workflow — database update, payment authorization, notification — twice with the same injected failure before the final step: once with no boundary, once behind Clared. No external accounts or API keys are required. This is an in-memory simulator: it does not contact Postgres, Stripe, or any other live system.
+
+**Prerequisites:** [Rust via rustup](https://rustup.rs) (`rust-toolchain.toml` pins the toolchain), Python 3.10+, and a free TCP port 4000. `uv` is used when installed; otherwise `python3 -m venv`. First `make demo` compiles the Rust service (a few minutes); a warm binary takes seconds.
 
 ```bash
 git clone https://github.com/clared-ai/clared.git
